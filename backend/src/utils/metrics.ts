@@ -1,4 +1,5 @@
 import { Registry, Counter, Histogram, Gauge } from 'prom-client';
+import type { PrismaClient } from '@prisma/client';
 
 export const register = new Registry();
 
@@ -48,3 +49,99 @@ export const roundResolutionDuration = new Histogram({
   buckets: [0.1, 0.5, 1, 2, 5, 10],
   registers: [register],
 });
+
+export const arenaStateTransitionsTotal = new Counter({
+  name: 'inversearena_arena_state_transitions_total',
+  help: 'Total number of arena round state transitions',
+  labelNames: ['from_state', 'to_state'],
+  registers: [register],
+});
+
+export const arenasActiveGauge = new Gauge({
+  name: 'inversearena_arenas_active_total',
+  help: 'Number of arenas with an unresolved active round',
+  registers: [register],
+});
+
+export const playersEliminatedTotal = new Counter({
+  name: 'inversearena_players_eliminated_total',
+  help: 'Total players eliminated across all arenas',
+  registers: [register],
+});
+
+export const payoutsSuccessTotal = new Counter({
+  name: 'inversearena_payouts_success_total',
+  help: 'Total successful prize payouts',
+  labelNames: ['asset'],
+  registers: [register],
+});
+
+export const payoutsDeadLetterTotal = new Counter({
+  name: 'inversearena_payouts_dead_letter_total',
+  help: 'Total payouts moved to dead status after exhausting failed retries',
+  labelNames: ['reason'],
+  registers: [register],
+});
+
+// 0 = closed (healthy), 1 = half-open (probing), 2 = open (failing)
+export const sorobanCircuitBreakerState = new Gauge({
+  name: 'inversearena_soroban_circuit_breaker_state',
+  help: 'Soroban RPC circuit breaker state: 0=closed, 1=half-open, 2=open',
+  registers: [register],
+});
+
+export const sorobanCircuitTransitionsTotal = new Counter({
+  name: 'inversearena_soroban_circuit_transitions_total',
+  help: 'Total Soroban RPC circuit breaker state transitions',
+  labelNames: ['to_state'],
+  registers: [register],
+});
+
+export const maintenanceMutationsBlockedTotal = new Counter({
+  name: 'inversearena_maintenance_mutations_blocked_total',
+  help: 'Total mutating requests rejected because a maintenance window was active',
+  labelNames: ['method'],
+  registers: [register],
+});
+
+export const maintenanceWindowsScheduledTotal = new Counter({
+  name: 'inversearena_maintenance_windows_scheduled_total',
+  help: 'Total maintenance windows scheduled, by outcome',
+  labelNames: ['status'],
+  registers: [register],
+});
+
+export const transactionAccessDecisionsTotal = new Counter({
+  name: 'inversearena_transaction_access_decisions_total',
+  help: 'Transaction/payout status access decisions, by operation, outcome and (server-side only) reason',
+  labelNames: ['operation', 'outcome', 'reason'],
+  registers: [register],
+});
+
+export const payloadLimitRejectionsTotal = new Counter({
+  name: 'inversearena_payload_limit_rejections_total',
+  help: 'Untrusted payloads rejected by schema-level size/depth limits, by boundary and limit kind',
+  labelNames: ['boundary', 'limit'],
+  registers: [register],
+});
+
+export const secretKeyVerificationsTotal = new Counter({
+  name: 'inversearena_secret_key_verifications_total',
+  help: 'JWT/webhook signature verifications during key rotation, by purpose, matched key slot and outcome',
+  labelNames: ['purpose', 'slot', 'outcome'],
+  registers: [register],
+});
+
+export async function refreshArenaMetrics(prisma: PrismaClient): Promise<void> {
+  const activeRounds = await prisma.round.findMany({
+    where: {
+      state: {
+        in: ['OPEN', 'CLOSED'],
+      },
+    },
+    distinct: ['arenaId'],
+    select: { arenaId: true },
+  });
+
+  arenasActiveGauge.set(activeRounds.length);
+}

@@ -19,10 +19,6 @@ export const ArenaCard = ({ arena }: ArenaCardProps) => {
     };
 
     const handleConfirmJoin = async () => {
-        // Here you would typically handle the logic for joining the arena,
-        // like making an API call.
-        console.log(`Joining arena ${arena.id}`);
-        // Close the modal on successful confirmation
         setIsModalOpen(false);
     };
 
@@ -74,7 +70,7 @@ export const ArenaCard = ({ arena }: ArenaCardProps) => {
                     onClose={handleCloseModal}
                     onConfirm={handleConfirmJoin}
                     arenaId={parseInt(arena.number, 10)}
-                    requiredStake={parseInt(arena.stake.split(' ')[0], 10)}
+                    requiredStake={parseInt(arena.stake.split(' ')[0] ?? '0', 10)}
                     currentPlayers={arena.playersJoined}
                     maxPlayers={arena.maxPlayers}
                     yieldGeneration={5} // Mock data
@@ -129,7 +125,7 @@ export const ArenaCard = ({ arena }: ArenaCardProps) => {
                 onClose={handleCloseModal}
                 onConfirm={handleConfirmJoin}
                 arenaId={parseInt(arena.number, 10)}
-                requiredStake={parseInt(arena.stake.split(' ')[0], 10)}
+                requiredStake={parseInt(arena.stake.split(' ')[0] ?? '0', 10)}
                 currentPlayers={arena.playersJoined}
                 maxPlayers={arena.maxPlayers}
                 yieldGeneration={5} // Mock data

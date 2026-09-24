@@ -23,7 +23,7 @@ export default function LeaderboardPage() {
   >();
   const [displayedCount, setDisplayedCount] = useState(INITIAL_PAGE_SIZE);
 
-  const { survivors, loading, error, hasMore, fetchMore } =
+  const { survivors, loading: isLoading, error, hasMore, fetchMore } =
     useLeaderboard(INITIAL_PAGE_SIZE);
 
   // Top 3 go to the podium; the rest fill the table
@@ -45,11 +45,8 @@ export default function LeaderboardPage() {
     return displayedTableSurvivors.slice(start, start + TABLE_ITEMS_PER_PAGE);
   }, [currentPage, displayedTableSurvivors]);
 
-  // Aggregate total yield across all players for the stat card
-  const totalYieldDisplay = useMemo(() => {
-    const total = survivors.reduce((sum, s) => sum + s.totalYield, 0);
-    return formatCurrency(total);
-  }, [survivors]);
+  // Use `survivors` directly for the stat card; it only represents the
+  // currently-loaded page, so the cards are labeled as partial (#1338).
 
   const handleChallenge = useCallback(
     (survivorId: string) => {
@@ -64,12 +61,12 @@ export default function LeaderboardPage() {
 
   // Handle loading more data when reaching the end
   const handleLoadMore = useCallback(async () => {
-    if (hasMore && !loading) {
+    if (hasMore && !isLoading) {
       await fetchMore();
       setDisplayedCount((prev) => prev + INITIAL_PAGE_SIZE);
       setCurrentPage(1); // Reset to first page after loading more
     }
-  }, [hasMore, loading, fetchMore]);
+  }, [hasMore, isLoading, fetchMore]);
 
   // Build podium display order: rank 2, rank 1, rank 3 (visual layout)
   const podiumOrdered = [
@@ -101,19 +98,19 @@ export default function LeaderboardPage() {
           <div className="grid w-full max-w-sm grid-cols-2 gap-4">
             <div className="border-[3px] border-[#0F1B2D] bg-black px-4 py-4 min-h-[88px]">
               <p className="text-[8px] font-mono uppercase tracking-[0.2em] text-zinc-500">
-                TOTAL YIELD
+                YIELD ON THIS PAGE
               </p>
               {isLoading ? (
                 <Skeleton className="h-8 w-24 mt-2" />
               ) : (
-                <p className="mt-2 text-2xl font-semibold text-white">
-                  {totalYieldDisplay}
+                <p className="mt-2 text-sm font-semibold text-zinc-400">
+                  {survivors.length.toLocaleString()} loaded · shown above
                 </p>
               )}
             </div>
             <div className="border-[3px] border-[#37FF1C] bg-[#37FF1C] px-4 py-4 min-h-[88px]">
               <p className="text-[8px] font-mono uppercase tracking-[0.2em] text-black/80">
-                LIVE AGENTS
+                LOADED AGENTS
               </p>
               {isLoading ? (
                 <Skeleton className="h-8 w-24 mt-2 bg-black/20" />
@@ -251,11 +248,11 @@ export default function LeaderboardPage() {
       <LeaderboardTable
         survivors={paginatedSurvivors}
         onChallenge={handleChallenge}
-        isLoading={loading}
+        isLoading={isLoading}
       />
 
       {/* Pagination & Load More */}
-      {!loading && (
+      {!isLoading && (
         <div className="flex flex-col items-center gap-4">
           <Pagination
             currentPage={currentPage}
@@ -265,7 +262,7 @@ export default function LeaderboardPage() {
           {hasMore && (
             <button
               onClick={handleLoadMore}
-              disabled={loading}
+              disabled={isLoading}
               className="mt-2 border border-[#37FF1C] bg-transparent px-6 py-2 text-sm font-mono uppercase tracking-[0.2em] text-[#37FF1C] transition-colors hover:bg-[#37FF1C] hover:text-black disabled:cursor-not-allowed disabled:opacity-50"
             >
               Load More
@@ -277,7 +274,7 @@ export default function LeaderboardPage() {
       <PoolCreationModal
         isOpen={isChallengeModalOpen}
         onClose={() => setIsChallengeModalOpen(false)}
-        challengedSurvivor={targetedSurvivor}
+        {...(targetedSurvivor !== undefined && { challengedSurvivor: targetedSurvivor })}
       />
     </div>
   );

@@ -1,19 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-
-function usePageVisibility() {
-  const [isVisible, setIsVisible] = useState(!document.hidden);
-
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      setIsVisible(!document.hidden);
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, []);
-
-  return isVisible;
-}
+import { usePageVisibility } from './usePageVisibility';
 
 export type PollingStatus = 'idle' | 'loading' | 'success' | 'error';
 
@@ -21,6 +7,8 @@ export interface PollingOptions<T> {
   intervalMs: number;
   enabled?: boolean;
   initialData?: T;
+  maxIntervalMs?: number;
+  jitterRatio?: number;
 }
 
 export interface FetcherContext {
@@ -44,10 +32,14 @@ export function usePolling<T>(
   const [error, setError] = useState<Error | null>(null);
   const [status, setStatus] = useState<PollingStatus>(initialData ? 'success' : 'idle');
 
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const isFetchingRef = useRef(false);
+  const generationRef = useRef(0);
+  const failuresRef = useRef(0);
   const isVisible = usePageVisibility();
+  const maxIntervalMs = options.maxIntervalMs ?? Math.max(intervalMs, 60_000);
+  const jitterRatio = options.jitterRatio ?? 0.1;
 
   const fetchData = useCallback(async () => {
     if (isFetchingRef.current) return;
@@ -57,26 +49,28 @@ export function usePolling<T>(
     }
 
     abortControllerRef.current = new AbortController();
+    const generation = ++generationRef.current;
+    const signal = abortControllerRef.current.signal;
     isFetchingRef.current = true;
     setStatus('loading');
 
     try {
-      const result = await fetcher({ signal: abortControllerRef.current.signal });
+      const result = await fetcher({ signal });
 
-      if (!abortControllerRef.current.signal.aborted) {
+      if (!signal.aborted && generation === generationRef.current) {
+        failuresRef.current = 0;
         setData(result);
         setError(null);
         setStatus('success');
       }
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (signal.aborted || generation !== generationRef.current) return;
 
-      if (!abortControllerRef.current?.signal.aborted) {
-        setError(err instanceof Error ? err : new Error('Unknown error'));
-        setStatus('error');
-      }
+      failuresRef.current += 1;
+      setError(err instanceof Error ? err : new Error('Unknown error'));
+      setStatus('error');
     } finally {
-      isFetchingRef.current = false;
+      if (generation === generationRef.current) isFetchingRef.current = false;
     }
   }, [fetcher]);
 
@@ -85,38 +79,37 @@ export function usePolling<T>(
   useEffect(() => {
     if (!enabled) return;
 
-    fetchData();
+    const schedule = (delayMs: number): void => {
+      intervalRef.current = setTimeout(async () => {
+        intervalRef.current = null;
+        await fetchData();
+        if (enabled && isVisible) {
+          const exponential = Math.min(intervalMs * 2 ** failuresRef.current, maxIntervalMs);
+          const jitter = exponential * jitterRatio * (Math.random() * 2 - 1);
+          schedule(Math.max(0, exponential + jitter));
+        }
+      }, delayMs);
+    };
 
     if (isVisible) {
-      intervalRef.current = setInterval(fetchData, intervalMs);
+      void fetchData().then(() => {
+        if (enabled && isVisible && !intervalRef.current) schedule(intervalMs);
+      });
     }
 
     return () => {
       if (intervalRef.current) {
-        clearInterval(intervalRef.current);
+        clearTimeout(intervalRef.current);
         intervalRef.current = null;
       }
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
+      generationRef.current += 1;
+      isFetchingRef.current = false;
     };
-  }, [enabled, intervalMs, isVisible, fetchData]);
-
-  useEffect(() => {
-    if (!enabled) return;
-
-    if (isVisible) {
-      if (!intervalRef.current) {
-        intervalRef.current = setInterval(fetchData, intervalMs);
-      }
-    } else {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    }
-  }, [isVisible, enabled, intervalMs, fetchData]);
+  }, [enabled, intervalMs, isVisible, maxIntervalMs, jitterRatio, fetchData]);
 
   return { data, error, status, refresh };
 }

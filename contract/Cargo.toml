@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "arena",
     "factory",
+    "oracle",
     "payout",
+    "rwa-adapter",
     "staking",
 ]
 
@@ -16,3 +18,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+overflow-checks = true

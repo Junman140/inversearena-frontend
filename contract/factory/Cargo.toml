@@ -12,3 +12,5 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 arena = { path = "../arena" }
+oracle = { path = "../oracle" }
+rwa-adapter = { path = "../rwa-adapter" }

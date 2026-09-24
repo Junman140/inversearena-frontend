@@ -1,18 +1,25 @@
 import {
+  Account,
   Address,
   BASE_FEE,
   Contract,
   Keypair,
+  Transaction,
   TransactionBuilder,
   nativeToScVal,
+  scValToNative,
+  xdr,
 } from "@stellar/stellar-sdk";
 // @ts-ignore
 import { rpc } from "@stellar/stellar-sdk";
 const { Api, Server } = rpc;
 import { z } from "zod";
 
+import { getOnChainGameState } from "./onChainReader";
 import { getPaymentConfig, type PaymentConfig } from "../config/paymentConfig";
 import type { TransactionRepository } from "../repositories/transactionRepository";
+import { payoutsSuccessTotal } from "../utils/metrics";
+import { CircuitOpenError, getSorobanBreaker, resetSorobanBreakerForTest, type CircuitBreaker } from "../utils/circuitBreaker";
 import type {
   BuildPayoutResult,
   CreatePayoutRequest,
@@ -22,7 +29,14 @@ import type {
 
 const PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 const IDEMPOTENCY_REGEX = /^[a-zA-Z0-9:_-]{8,128}$/;
-const AMOUNT_REGEX = /^\d+(\.\d{1,7})?$/;
+const AMOUNT_REGEX = /^\d+(\.\d{0,7})?$/;
+
+const PayoutBreakdownSchema = z.object({
+  principal: z.number().finite().nonnegative(),
+  yieldAmount: z.number().finite().nonnegative(),
+  platformFee: z.number().finite().nonnegative(),
+  dust: z.number().finite().nonnegative(),
+});
 
 const CreatePayoutRequestSchema = z.object({
   payoutId: z.string().trim().min(1).max(128),
@@ -39,9 +53,15 @@ const CreatePayoutRequestSchema = z.object({
     .string()
     .trim()
     .regex(IDEMPOTENCY_REGEX, "Invalid idempotency key format"),
+  // #1407: optional settlement breakdown, populated when the caller (e.g. an
+  // operator submitting a round-settlement payout computed via
+  // roundService.computePayouts) has one. Persisted verbatim — this service
+  // does not recompute or validate it against `amount` beyond basic shape,
+  // since that game-economics logic belongs to whoever produced it.
+  breakdown: PayoutBreakdownSchema.optional(),
 });
 
-function toStroops(amount: string): string {
+export function toStroops(amount: string): string {
   const [wholePart, fractionPart = ""] = amount.split(".");
   const padded = (fractionPart + "0000000").slice(0, 7);
   const combined = `${wholePart}${padded}`.replace(/^0+(?=\d)/, "");
@@ -73,11 +93,33 @@ const delay = async (ms: number): Promise<void> =>
 export interface PaymentServiceOptions {
   config?: PaymentConfig;
   rpcServer?: any;
+  circuitBreaker?: CircuitBreaker;
+}
+
+/**
+ * Raised when a second payout is attempted for a payout id that already has a
+ * transaction, under a different idempotency key (#1353).
+ */
+export class PayoutConflictError extends Error {
+  readonly status = 409;
+  readonly code = "PAYOUT_ALREADY_EXISTS";
+
+  constructor(
+    readonly payoutId: string,
+    readonly existingIdempotencyKey: string,
+  ) {
+    super(
+      `A payout transaction already exists for payoutId ${payoutId}. ` +
+        "Re-send the original idempotency key to retrieve it rather than creating a second payout.",
+    );
+    this.name = "PayoutConflictError";
+  }
 }
 
 export class PaymentService {
   private readonly config: PaymentConfig;
   private readonly rpcServer: any;
+  private readonly breaker: CircuitBreaker;
 
   constructor(
     private readonly transactions: TransactionRepository,
@@ -85,9 +127,31 @@ export class PaymentService {
   ) {
     this.config = options.config ?? getPaymentConfig();
     this.rpcServer = options.rpcServer ?? new Server(this.config.sorobanRpcUrl);
+    this.breaker = options.circuitBreaker ?? getSorobanBreaker();
   }
 
-  async createPayoutTransaction(input: unknown): Promise<BuildPayoutResult> {
+  async getClaimReadiness(arenaId: string): Promise<{ version: 1; arenaId: string; ready: boolean; chainState: string; payoutStatus: string | null; reason: string }> {
+    const startedAt = Date.now();
+    if (!/^C[A-Z2-7]{55}$/ .test(arenaId)) throw new Error("Invalid arena contract id");
+    try {
+      const [chainState, records] = await Promise.all([getOnChainGameState(arenaId), this.transactions.listByStatus(["built", "queued", "awaiting_signature", "submitted", "confirmed", "failed", "dead"], 1000)]);
+      const payout = records.filter((record) => record.payoutId === arenaId).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0];
+      const payoutBlocksClaim = payout?.status === "submitted" || payout?.status === "confirmed";
+      const ready = chainState === "Finished" && !payoutBlocksClaim;
+      const reason = chainState !== "Finished" ? "contract_not_finished" : payoutBlocksClaim ? "payout_already_in_progress_or_complete" : "ready";
+      console.info(JSON.stringify({ event: "claim_readiness_success", arenaId, ready, latencyMs: Date.now() - startedAt }));
+      return { version: 1, arenaId, ready, chainState, payoutStatus: payout?.status ?? null, reason };
+    } catch (error) {
+      console.error(JSON.stringify({ event: "claim_readiness_failure", arenaId, latencyMs: Date.now() - startedAt, error: error instanceof Error ? error.message : "unknown" }));
+      throw error;
+    }
+  }
+
+  getSorobanBreakerStats() {
+    return this.breaker.getStats();
+  }
+
+  async createPayoutTransaction(input: unknown, ownerId?: string | null): Promise<BuildPayoutResult> {
     const request = CreatePayoutRequestSchema.parse(input) as CreatePayoutRequest;
 
     const existing = await this.transactions.findByIdempotencyKey(request.idempotencyKey);
@@ -97,6 +161,21 @@ export class PaymentService {
         transaction: existing,
         unsignedXdr: existing.unsignedXdr,
       };
+    }
+
+    // De-duplicating on the caller-supplied idempotency key alone was not enough
+    // (#1353). A retry after an ambiguous timeout typically generates a *fresh*
+    // key, which sailed past the check above, reserved its own nonce and built a
+    // second, independently-submittable transaction for the same prize — a real
+    // double payment. The payout id is the business identity of the payout, so
+    // it is what uniqueness must be enforced on.
+    //
+    // The database now also carries a unique constraint on payout_id; this check
+    // exists so the caller gets a clear conflict instead of a driver error, and
+    // so the nonce below is never burned on a duplicate.
+    const duplicate = await this.transactions.findByPayoutId(request.payoutId);
+    if (duplicate) {
+      throw new PayoutConflictError(request.payoutId, duplicate.idempotencyKey);
     }
 
     const nonce = await this.transactions.reserveNextNonce(this.config.sourceAccount);
@@ -139,6 +218,11 @@ export class PaymentService {
       createdAt: now,
       updatedAt: now,
       confirmedAt: null,
+      ownerId: ownerId ?? null,
+      principal: request.breakdown?.principal ?? null,
+      yieldAmount: request.breakdown?.yieldAmount ?? null,
+      platformFee: request.breakdown?.platformFee ?? null,
+      dust: request.breakdown?.dust ?? null,
     };
 
     await this.transactions.insert(transaction);
@@ -157,7 +241,9 @@ export class PaymentService {
       throw new Error(`Transaction ${transactionId} is not waiting for signature`);
     }
 
-    TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase);
+    // Audit the signed XDR before queuing (#667): a compromised external signer
+    // could return a validly-signed transaction that redirects the payout.
+    this.assertSignedTransactionMatches(signedXdr, transaction);
 
     return this.transactions.update(transactionId, {
       signedXdr,
@@ -203,7 +289,18 @@ export class PaymentService {
         transaction.signedXdr,
         this.config.networkPassphrase
       );
-      const sendResult = await this.rpcServer.sendTransaction(signedTransaction);
+
+      let sendResult: Awaited<ReturnType<typeof this.rpcServer.sendTransaction>>;
+      try {
+        sendResult = await this.breaker.fire(() =>
+          this.rpcServer.sendTransaction(signedTransaction)
+        );
+      } catch (err) {
+        if (err instanceof CircuitOpenError) {
+          return { transaction, submitted: false };
+        }
+        throw err;
+      }
 
       if (sendResult.status === "ERROR") {
         const failed = await this.transactions.update(transaction.id, {
@@ -252,9 +349,20 @@ export class PaymentService {
       return transaction;
     }
 
-    const onChain = await this.rpcServer.getTransaction(transaction.txHash);
+    let onChain: Awaited<ReturnType<typeof this.rpcServer.getTransaction>>;
+    try {
+      onChain = await this.breaker.fire(() =>
+        this.rpcServer.getTransaction(transaction.txHash)
+      );
+    } catch (err) {
+      if (err instanceof CircuitOpenError) {
+        return transaction;
+      }
+      throw err;
+    }
 
     if (onChain.status === Api.GetTransactionStatus.SUCCESS) {
+      payoutsSuccessTotal.inc({ asset: transaction.asset });
       return this.transactions.update(transaction.id, {
         status: "confirmed",
         confirmedAt: new Date(),
@@ -288,6 +396,88 @@ export class PaymentService {
     return current;
   }
 
+  /**
+   * Verify that a signed payout transaction matches the stored payout record
+   * and this service's configuration before it is queued for submission (#667).
+   *
+   * Rejects if the source account, invoked contract, called method, payout
+   * destination, or amount differ from what was authorised. Without this, a
+   * compromised KMS signer could return a validly-signed XDR redirecting funds.
+   */
+  private assertSignedTransactionMatches(
+    signedXdr: string,
+    transaction: TransactionRecord
+  ): void {
+    let parsed: ReturnType<typeof TransactionBuilder.fromXDR>;
+    try {
+      parsed = TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase);
+    } catch {
+      throw new Error("Signed XDR could not be parsed");
+    }
+
+    // Fee-bump wrappers are not expected for payouts.
+    if (!(parsed instanceof Transaction)) {
+      throw new Error("Signed transaction must not be a fee-bump transaction");
+    }
+    const tx = parsed;
+
+    if (tx.source !== this.config.sourceAccount) {
+      throw new Error("Signed transaction source account does not match the payout source");
+    }
+    if (tx.operations.length !== 1) {
+      throw new Error("Signed transaction must contain exactly one operation");
+    }
+
+    const op = tx.operations[0] as { type: string; func?: xdr.HostFunction };
+    if (op.type !== "invokeHostFunction" || !op.func) {
+      throw new Error("Signed transaction operation is not a contract invocation");
+    }
+    if (op.func.switch().name !== "hostFunctionTypeInvokeContract") {
+      throw new Error("Signed transaction does not invoke a contract");
+    }
+
+    const invoke = op.func.invokeContract();
+    const contractId = Address.fromScAddress(invoke.contractAddress()).toString();
+    if (contractId !== this.config.payoutContractId) {
+      throw new Error("Signed transaction targets an unexpected contract");
+    }
+    if (invoke.functionName().toString() !== this.config.payoutMethodName) {
+      throw new Error("Signed transaction calls an unexpected contract method");
+    }
+
+    const args = invoke.args();
+    if (args.length !== 3) {
+      throw new Error("Signed transaction must have exactly 3 contract arguments");
+    }
+
+    // distribute_winnings(payout_id: u64, winner: Address, amount: i128)
+    const destination = Address.fromScVal(args[1]!).toString();
+    if (destination !== transaction.destinationAccount) {
+      throw new Error("Signed transaction destination does not match the payout record");
+    }
+    const amount = String(scValToNative(args[2]!));
+    if (amount !== transaction.amountStroops) {
+      throw new Error("Signed transaction amount does not match the payout record");
+    }
+    // args[0] must equal the nonce reserved for this payout record — otherwise a
+    // compromised signer could redirect the on-chain payout_id.
+    const payoutIdArg = scValToNative(args[0]!);
+    if (typeof payoutIdArg !== "bigint" || payoutIdArg !== BigInt(transaction.nonce)) {
+      throw new Error(
+        "Signed transaction payout_id argument does not match the reserved nonce"
+      );
+    }
+  }
+
+  /**
+   * Tears down shared async resources held by this service instance.
+   * Must be called in `afterAll` / `afterEach` hooks in tests to prevent
+   * Jest from reporting open async handles (#1194).
+   */
+  destroy(): void {
+    resetSorobanBreakerForTest();
+  }
+
   private async requireTransaction(transactionId: string): Promise<TransactionRecord> {
     const transaction = await this.transactions.findById(transactionId);
     if (!transaction) {
@@ -297,17 +487,23 @@ export class PaymentService {
   }
 
   private async buildPreparedTransaction(request: CreatePayoutRequest, nonce: number) {
-    const sourceAccount = await this.rpcServer.getAccount(this.config.sourceAccount);
+    const sourceAccount = await this.breaker.fire(() =>
+      this.rpcServer.getAccount(this.config.sourceAccount)
+    ) as Account;
     const contract = new Contract(this.config.payoutContractId);
     const amountStroops = toStroops(request.amount);
 
+    // Must match contract/payout/src/lib.rs distribute_winnings(payout_id: u64,
+    // winner: Address, amount: i128) exactly — 3 args, this order. The token is
+    // fixed by the contract at initialize time (no per-call asset argument),
+    // and the contract has no nonce param, so the reserved per-source `nonce`
+    // doubles as the on-chain idempotency key (`payout_id`). Our string
+    // `request.payoutId` stays an off-chain-only identifier.
     const operation = contract.call(
       this.config.payoutMethodName,
+      nativeToScVal(BigInt(nonce), { type: "u64" }),
       new Address(request.destinationAccount).toScVal(),
       nativeToScVal(BigInt(amountStroops), { type: "i128" }),
-      nativeToScVal(request.asset),
-      nativeToScVal(BigInt(nonce), { type: "u64" }),
-      nativeToScVal(request.payoutId)
     );
 
     const built = new TransactionBuilder(sourceAccount, {
@@ -318,7 +514,9 @@ export class PaymentService {
       .setTimeout(60)
       .build();
 
-    const preparedTransaction = await this.rpcServer.prepareTransaction(built);
+    const preparedTransaction = await this.breaker.fire(() =>
+      this.rpcServer.prepareTransaction(built)
+    ) as Transaction;
 
     const feeStroops = Number(preparedTransaction.fee);
     if (!Number.isFinite(feeStroops) || feeStroops <= 0) {

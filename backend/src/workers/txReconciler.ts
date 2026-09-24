@@ -1,41 +1,70 @@
 import { Worker, type Job } from "bullmq";
 import type { PaymentService } from "../services/paymentService";
-import type { TransactionRepository } from "../repositories/transactionRepository";
 import { TX_CONFIRM_QUEUE, type ConfirmJobData } from "../queues/txQueue";
+import { logger } from "../utils/logger";
+import { TransactionStateMachine } from "../services/transactionStateMachine";
+import { TransactionState } from "../domain/transactionState";
+
+export async function reconcileSubmittedTransaction(
+  job: Job<ConfirmJobData>,
+  paymentService: PaymentService,
+  transactionStateMachine: TransactionStateMachine,
+): Promise<void> {
+  const txStatus = await transactionStateMachine.confirmSubmitted(job.data.transactionId);
+
+  if (txStatus === TransactionState.SUBMITTED) {
+    throw new Error(`Transaction ${job.data.transactionId} still pending on-chain`);
+  }
+}
+
+export async function handleTxReconcilerFailure(
+  job: Job<ConfirmJobData> | undefined,
+  err: Error,
+  transactionStateMachine: TransactionStateMachine,
+): Promise<void> {
+  if (!job) return;
+  const maxAttempts = job.opts.attempts ?? 10;
+  if (job.attemptsMade < maxAttempts) {
+    logger.info(
+      {
+        transactionId: job.data.transactionId,
+        attemptsMade: job.attemptsMade,
+        maxAttempts,
+        err,
+      },
+      "TxReconciler retry scheduled",
+    );
+    return;
+  }
+
+  await transactionStateMachine.markDead(job.data.transactionId, `Confirmation failed after ${maxAttempts} attempts: ${err.message}`);
+  logger.error(
+    {
+      transactionId: job.data.transactionId,
+      attemptsMade: job.attemptsMade,
+      maxAttempts,
+      err,
+    },
+    "TxReconciler exhausted retries",
+  );
+}
 
 export function startTxReconcilerWorker(
   paymentService: PaymentService,
-  transactions: TransactionRepository
+  transactionStateMachine: TransactionStateMachine,
 ): Worker<ConfirmJobData> {
   const worker = new Worker<ConfirmJobData>(
     TX_CONFIRM_QUEUE,
-    async (job: Job<ConfirmJobData>) => {
-      const tx = await paymentService.confirmSubmittedTransaction(job.data.transactionId);
-
-      if (tx.status === "submitted") {
-        // Still pending on-chain — throw so BullMQ retries with exponential backoff
-        throw new Error(`Transaction ${job.data.transactionId} still pending on-chain`);
-      }
-      // "confirmed" or "failed" → terminal state, job completes without retry
-    },
-    { connection: { url: process.env.REDIS_URL ?? "redis://localhost:6379" } }
+    async (job: Job<ConfirmJobData>) => reconcileSubmittedTransaction(job, paymentService, transactionStateMachine),
+    { connection: { url: process.env.REDIS_URL ?? "redis://localhost:6379" } },
   );
 
-  // Dead-letter: fired on every failure attempt; only act when all retries are exhausted
   worker.on("failed", async (job: Job<ConfirmJobData> | undefined, err: Error) => {
-    if (!job) return;
-    const maxAttempts = job.opts.attempts ?? 1;
-    if (job.attemptsMade >= maxAttempts) {
-      await transactions.update(job.data.transactionId, {
-        status: "dead",
-        errorMessage: `Confirmation failed after ${maxAttempts} attempts: ${err.message}`,
-        updatedAt: new Date(),
-      });
-    }
+    await handleTxReconcilerFailure(job, err, transactionStateMachine);
   });
 
   worker.on("error", (err: Error) => {
-    console.error("[TxReconciler] Worker error:", err.message);
+    logger.error({ err }, "TxReconciler worker error");
   });
 
   return worker;

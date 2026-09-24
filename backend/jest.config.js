@@ -1,14 +1,48 @@
 /** @type {import('ts-jest').JestConfigWithTsJest} */
 module.exports = {
-    preset: "ts-jest",
-    testEnvironment: "node",
-    roots: ["<rootDir>/src", "<rootDir>/test"],
-    testMatch: ["**/*.test.ts"],
-    transform: {
-        "^.+\\.tsx?$": ["ts-jest", { tsconfig: "tsconfig.json" }],
-    },
-    setupFilesAfterEnv: ["<rootDir>/test/setup.ts"],
-    moduleNameMapper: {
-        "^@/(.*)$": "<rootDir>/src/$1",
-    },
+  preset: "ts-jest",
+  testEnvironment: "node",
+  roots: ["<rootDir>/src", "<rootDir>/test", "<rootDir>/tests"],
+  testMatch: ["**/*.test.ts"],
+  testPathIgnorePatterns: [
+    "/node_modules/",
+    // node:test suites (run via `node --test` in CI)
+    "<rootDir>/tests/request-validation\\.unit\\.test\\.ts",
+    "<rootDir>/tests/roundRepository\\.unit\\.test\\.ts",
+    "<rootDir>/tests/payment\\.unit\\.test\\.ts",
+    "<rootDir>/tests/auth\\.unit\\.test\\.ts",
+    "<rootDir>/tests/auth-middleware\\.unit\\.test\\.ts",
+    "<rootDir>/tests/arenas\\.route\\.unit\\.test\\.ts",
+    "<rootDir>/tests/arenaService\\.deployment\\.unit\\.test\\.ts",
+    "<rootDir>/tests/worker\\.route\\.unit\\.test\\.ts",
+    "<rootDir>/tests/paymentWorker\\.test\\.ts",
+    "<rootDir>/tests/adminReindexPool\\.unit\\.test\\.ts",
+    "<rootDir>/tests/leaderboardPagination\\.unit\\.test\\.ts",
+    "<rootDir>/tests/payoutIdUniqueness\\.unit\\.test\\.ts",
+    "<rootDir>/tests/syncPlayersAuth\\.unit\\.test\\.ts",
+    "<rootDir>/tests/ledgerClock\\.unit\\.test\\.ts",
+    "<rootDir>/tests/maintenanceService\\.unit\\.test\\.ts",
+    "<rootDir>/tests/maintenanceGuard\\.unit\\.test\\.ts",
+    "<rootDir>/tests/adminMaintenance\\.unit\\.test\\.ts",
+    "<rootDir>/tests/authDeviceSessions\\.unit\\.test\\.ts",
+    "<rootDir>/tests/onChainReader\\.snapshot\\.unit\\.test\\.ts",
+    "<rootDir>/tests/payoutsReceipt\\.unit\\.test\\.ts",
+    // Legacy script-style runners (no Jest `describe`/`it`)
+    "<rootDir>/tests/leaderboard\\.test\\.ts",
+    "<rootDir>/tests/security-headers\\.test\\.ts",
+    "<rootDir>/tests/arenaStats\\.test\\.ts",
+    "<rootDir>/tests/metrics\\.test\\.ts",
+    "<rootDir>/tests/payment\\.integration\\.test\\.ts",
+    "<rootDir>/tests/round\\.integration\\.test\\.ts",
+  ],
+  transform: {
+    "^.+\\.tsx?$": ["ts-jest", { tsconfig: "tsconfig.json" }],
+  },
+  setupFilesAfterEnv: ["<rootDir>/test/setup.ts"],
+  moduleNameMapper: {
+    "^@/(.*)$": "<rootDir>/src/$1",
+  },
+  // Surface open async handle sources so tests cannot silently leave timers or
+  // connections running after the suite finishes (#1194).
+  detectOpenHandles: true,
 };

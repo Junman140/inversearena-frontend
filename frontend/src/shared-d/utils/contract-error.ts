@@ -66,12 +66,20 @@ export class ContractError extends Error {
   readonly fn: string;
   /** Original error (if wrapping) */
   readonly cause?: unknown;
+  /**
+   * Transaction hash, when known (#1135) — set on TRANSACTION_TIMEOUT so a
+   * caller can look the transaction up manually (Horizon, an explorer) when
+   * confirmation couldn't be established before polling gave up. The
+   * transaction may still succeed after this error is thrown.
+   */
+  readonly hash?: string | undefined;
 
   constructor(opts: {
     code: ContractErrorCode;
     message?: string;
     fn: string;
     cause?: unknown;
+    hash?: string | undefined;
   }) {
     const message = opts.message ?? DEFAULT_MESSAGES[opts.code];
     super(message);
@@ -79,6 +87,7 @@ export class ContractError extends Error {
     this.code = opts.code;
     this.fn = opts.fn;
     this.cause = opts.cause;
+    this.hash = opts.hash;
 
     // Maintains proper stack trace in V8
     if (Error.captureStackTrace) {
@@ -112,9 +121,7 @@ export function parseContractError(
     const detail = extractSimulationDetail(error);
     return new ContractError({
       code: ContractErrorCode.SIMULATION_FAILED,
-      message: detail
-        ? `Contract simulation failed: ${detail}`
-        : undefined,
+      ...(detail ? { message: `Contract simulation failed: ${detail}` } : {}),
       fn,
       cause: error,
     });
@@ -185,7 +192,7 @@ export function parseContractError(
   // ── Fallback ─────────────────────────────────────────────────────
   return new ContractError({
     code: ContractErrorCode.UNKNOWN,
-    message: msg || undefined,
+    ...(msg ? { message: msg } : {}),
     fn,
     cause: error,
   });
@@ -266,7 +273,7 @@ function extractSimulationDetail(error: unknown): string | null {
 function parseHostError(raw: string): string {
   const contractMatch = raw.match(/Error\(Contract,\s*#(\d+)\)/);
   if (contractMatch) {
-    const code = Number.parseInt(contractMatch[1], 10);
+    const code = Number.parseInt(contractMatch[1]!, 10);
     return userMessageForContractPanicCode(code);
   }
 

@@ -12,14 +12,33 @@ interface TransactionDetail {
     isImportant?: boolean;
 }
 
+/**
+ * Progress callbacks handed to `onConfirm` so the modal can follow a flow it
+ * does not own. Callers that both sign and submit must call `onSigned()` once
+ * the wallet has returned the signed XDR — otherwise the modal cannot tell
+ * signing apart from the on-chain confirmation wait that follows it (#1336).
+ */
+export interface TransactionProgress {
+    onSigned: () => void;
+}
+
+/** Fee sponsorship eligibility for winner claim (#1413). */
+export interface FeeSponsorshipEligibility {
+    tokenId: string;
+    status: "PENDING" | "CONSUMED" | "EXPIRED";
+    expiresAt: string;
+}
+
 interface TransactionModalProps {
     isOpen: boolean;
     onClose: () => void;
     title: string;
     description?: string;
     details: TransactionDetail[];
-    onConfirm: () => Promise<void>;
+    onConfirm: (progress: TransactionProgress) => Promise<void>;
     confirmLabel?: string;
+    /** If provided, the modal shows a fee-sponsorship badge (#1413). */
+    feeSponsorshipEligibility?: FeeSponsorshipEligibility | null;
 }
 
 export function TransactionModal({
@@ -30,6 +49,7 @@ export function TransactionModal({
     details,
     onConfirm,
     confirmLabel = "Approve Transaction",
+    feeSponsorshipEligibility,
 }: TransactionModalProps) {
     const [state, setState] = useState<TransactionState>("REVIEW");
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -48,14 +68,12 @@ export function TransactionModal({
             // Give a small delay to show state change or await actual wallet interaction
             await new Promise(r => setTimeout(r, 500));
 
-            // Call the actual confirm handler (which triggers wallet sign)
-            await onConfirm();
+            // Call the actual confirm handler (which triggers wallet sign, then
+            // submits). It reports back the moment the wallet has signed so the
+            // several-second on-chain confirmation wait no longer sits behind
+            // "Please approve the transaction in Freighter" (#1336).
+            await onConfirm({ onSigned: () => setState("SUBMITTING") });
 
-            // If we get here, we assume it's submitting or done. 
-            // The caller might handle the actual submission and state updates, but if `onConfirm` resolves, 
-            // we usually consider it submitted. 
-            // However, if onConfirm involves the whole flow including submission, it might take time.
-            // Let's assume onConfirm resolves when the txn is successfully submitted on-chain or at least sent.
             setState("SUCCESS");
         } catch (err: unknown) {
             setState("ERROR");
@@ -70,6 +88,31 @@ export function TransactionModal({
             case "REVIEW":
                 return (
                     <>
+                        {/* ── Fee sponsorship badge (#1413) ───────────────────────── */}
+                        {feeSponsorshipEligibility?.status === "PENDING" && (
+                            <div
+                                className="flex items-center gap-2 mb-4 px-3 py-2 bg-green-900/40 border border-green-500/40 text-green-400"
+                                role="status"
+                                aria-label="Fee sponsorship active"
+                            >
+                                <span className="material-symbols-outlined text-base">verified</span>
+                                <span className="text-xs font-bold uppercase tracking-widest">
+                                    Network fee sponsored — no XLM required for this claim
+                                </span>
+                            </div>
+                        )}
+                        {feeSponsorshipEligibility?.status === "EXPIRED" && (
+                            <div
+                                className="flex items-center gap-2 mb-4 px-3 py-2 bg-yellow-900/40 border border-yellow-500/40 text-yellow-400"
+                                role="alert"
+                            >
+                                <span className="material-symbols-outlined text-base">warning</span>
+                                <span className="text-xs font-bold uppercase tracking-widest">
+                                    Fee sponsorship expired — standard network fee applies
+                                </span>
+                            </div>
+                        )}
+
                         <div className="space-y-4 mb-8">
                             {details.map((detail, index) => (
                                 <div key={index} className="flex justify-between items-center border-b border-white/10 pb-2">

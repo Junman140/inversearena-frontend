@@ -123,6 +123,8 @@ The arena pool contract uses `#[contracterror]` with **explicit** `repr(u32)` va
 | 20 | `MaxSubmissionsPerRound` | Per-round submission bound (`contract/BOUNDS.md`) |
 | 21 | `PlayerEliminated` | Eliminated player attempted action |
 | 42 | `NotWhitelisted` | Non-whitelisted player attempted to join a private arena |
+| 37 | `ArenaAlreadyStarted` | `join_arena` after at least one round has been played, even while the arena is back in `Open` between rounds (#1358) |
+| 38 | `InvalidLeaderboardLimit` | `configure_leaderboard_limit` with `0` or a value above `MAX_LEADERBOARD_LIMIT` (100) (#1455) |
 | 22 | `WrongRoundNumber` | Submitted for wrong round |
 | 23 | `NotEnoughPlayers` | Too few players to start/resolve round |
 | 24 | `InvalidCapacity` | `set_capacity` value out of `[MIN, MAX]` range |
@@ -137,6 +139,22 @@ The arena pool contract uses `#[contracterror]` with **explicit** `repr(u32)` va
 > 3. `contract/arena/src/abi_guard.rs` — add `("VariantName", ArenaError::VariantName)` to the `pairs` slice.
 >
 > Omitting any of the three lets `cargo test` pass while the snapshot is stale, providing false safety for downstream consumers that branch on error codes.
+
+### Staking contract — Rust `StakingError` (`contract/staking`)
+
+The staking contract uses `#[contracterror]` with explicit `repr(u32)` values (not the 300–399 band above). These are the codes emitted by `StakingContract`:
+
+| Code | Variant | Meaning | User-facing message |
+|------|---------|---------|---------------------|
+| 1 | `NotInitialized` | `initialize` not called | Staking is not available yet. |
+| 2 | `AlreadyInitialized` | `initialize` called twice | Staking is already set up. |
+| 3 | `Paused` | Contract paused | Staking is temporarily unavailable. |
+| 4 | `InvalidAmount` | Non-positive amount | Enter an amount greater than zero. |
+| 5 | `InsufficientShares` | Unstaking more shares than held | You do not have that many shares to unstake. |
+| 6 | `ZeroShares` | Deposit too small to mint a share at the pool's current value | This deposit is too small for the current pool value. Stake more. |
+| 7 | `BelowMinimumInitialStake` | First deposit into an empty pool is under `MIN_INITIAL_STAKE` | The first deposit must be at least the minimum initial stake. |
+
+Codes `6` and `7` are the share-inflation guards documented on `MIN_INITIAL_STAKE` in `contract/staking/src/lib.rs`. Clients can read the current floor from the `min_initial_stake` view and validate before submitting rather than surfacing code `7`.
 
 ---
 

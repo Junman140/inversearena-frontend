@@ -105,6 +105,60 @@ Set these values in deployment secrets (never commit private keys):
 
 ---
 
+## API Documentation
+
+- **OpenAPI spec**: `GET /api/docs.json` (OpenAPI 3.1, generated from Zod schemas)
+- **Swagger UI**: `GET /api/docs`
+
+## Rate Limiting
+
+Redis-backed limits (`rate-limiter-flexible`) apply to:
+
+- `POST /api/auth/nonce`
+- `POST /api/auth/verify` (IP + wallet dual scope)
+- `POST /api/auth/refresh`
+- `POST /api/pools`
+- `GET /api/arenas/:id/stream` requires authentication and caps active streams
+  per IP and per arena. Configure the process-local caps with
+  `SSE_MAX_CONNECTIONS_PER_IP` and `SSE_MAX_CONNECTIONS_PER_ARENA`.
+
+Violations return HTTP `429` with a `Retry-After` header. Configure via `RATE_LIMIT_*` env vars (see `.env.example`).
+
+## API Endpoints
+
+### Arena Participants
+
+**GET /api/arenas/:id/participants**
+
+Returns a paginated list of participants in a specific arena with their status (active/eliminated).
+
+**Query Parameters:**
+- `limit` (optional): Number of items per page (1-100, default: 25)
+- `cursor` (optional): Opaque pagination cursor from previous response
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "walletAddress": "GABC...",
+      "status": "active",
+      "joinedAt": "2026-05-29T10:30:00.000Z"
+    }
+  ],
+  "cursor": "eyJvZmZzZXQiOjI1fQ",
+  "hasMore": true
+}
+```
+
+**Status Codes:**
+- `200`: Success
+- `404`: Arena not found
+
+**Cache:** 5 seconds
+
+---
+
 ## Documentation
 
 - **[Metrics & Monitoring](./docs/METRICS.md)** - Prometheus metrics guide
@@ -112,3 +166,8 @@ Set these values in deployment secrets (never commit private keys):
 - **[Payout Execution](./docs/PAYOUT_EXECUTION.md)** - Payment system guide
 - **[Quick Start Guide](./docs/QUICKSTART_ROUNDS.md)** - Getting started
 - **[Implementation Summary](./docs/IMPLEMENTATION_SUMMARY.md)** - Feature overview
+- **[Arena Stats API](./docs/ARENA_STATS_API.md)** - `GET /api/arenas/:id/stats` response schema, including degraded mode
+- **[Degraded-Mode Arena Reads](./docs/DEGRADED_ARENA_READS.md)** - #1408 design note
+- **[Admin Maintenance Windows](./docs/MAINTENANCE_WINDOWS.md)** - #1399 design note
+- **[Authenticated Device Sessions](./docs/DEVICE_SESSIONS.md)** - #1410 design note
+- **[Settlement Manifest & Receipts](./docs/SETTLEMENT_RECEIPTS.md)** - #1407 design note

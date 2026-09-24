@@ -1,77 +1,227 @@
 import { PrismaClient } from '@prisma/client';
+import { Contract, Keypair, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import { StellarRpcGateway } from "../../frontend/src/shared-d/services/stellarRpcGateway";
+
 import { RoundRepository } from '../repositories/roundRepository';
-import type { RoundInput, RoundResolution, Payout } from '../types/round';
+import type { RoundInput, RoundMetadata, RoundResolution, Payout } from '../types/round';
 import { RoundState } from '../types/round';
-import { roundResolutionsTotal, roundResolutionDuration } from '../utils/metrics';
+import {
+  arenaStateTransitionsTotal,
+  playersEliminatedTotal,
+  refreshArenaMetrics,
+  roundResolutionsTotal,
+  roundResolutionDuration,
+} from '../utils/metrics';
+import { invalidateArenaStats } from '../cache/cacheService';
+import {
+  getOnChainActivePlayerIds,
+  getOnChainWinner,
+} from './onChainReader';
+import { getStellarConfig, type StellarConfig } from '../config/stellarConfig';
+import { computeSettlementBreakdown } from './settlementService';
+
+export interface OnChainRoundState {
+  roundId: string;
+  oracleYield: number;
+  isFinalized: boolean;
+}
+
+export interface OnChainReader {
+  getRoundState(roundId: string): Promise<OnChainRoundState>;
+  /** Returns wallet addresses of players still active after the latest resolve_round. */
+  getActivePlayers(contractId: string): Promise<string[]>;
+  /** Returns the single on-chain winner address once the game is finished, or null. */
+  getWinner(contractId: string): Promise<string | null>;
+}
+
+export class NoOpOnChainReader implements OnChainReader {
+  async getRoundState(roundId: string): Promise<OnChainRoundState> {
+    return { roundId, oracleYield: 0, isFinalized: false };
+  }
+  async getActivePlayers(_contractId: string): Promise<string[]> {
+    return [];
+  }
+  async getWinner(_contractId: string): Promise<string | null> {
+    return null;
+  }
+}
+
+/** Production implementation backed by the Soroban simulation helpers. */
+export class SorobanOnChainReader implements OnChainReader {
+  async getRoundState(roundId: string): Promise<OnChainRoundState> {
+    return { roundId, oracleYield: 0, isFinalized: false };
+  }
+  async getActivePlayers(contractId: string): Promise<string[]> {
+    return getOnChainActivePlayerIds(contractId);
+  }
+  async getWinner(contractId: string): Promise<string | null> {
+    return getOnChainWinner(contractId);
+  }
+}
 
 export class RoundService {
   private roundRepo: RoundRepository;
+  private onChainReader: OnChainReader;
 
-  constructor(private prisma: PrismaClient) {
+  constructor(
+    private prisma: PrismaClient,
+    private stellarConfig: StellarConfig = getStellarConfig(),
+    private stellarRpcGateway: StellarRpcGateway = new StellarRpcGateway(),
+    onChainReader?: OnChainReader,
+  ) {
     this.roundRepo = new RoundRepository(prisma);
+    this.onChainReader = onChainReader ?? new SorobanOnChainReader();
+  }
+
+  /**
+   * Build, sign, submit, and confirm a resolve_round call on the arena contract.
+   * Returns the on-chain round number on success.
+   */
+  private async submitOnChainResolve(
+    contractId: string,
+    roundNumber: number,
+  ): Promise<number> {
+    const signerSecret = process.env.ARENA_ADMIN_SECRET;
+
+    if (!signerSecret) {
+      throw new Error("ARENA_ADMIN_SECRET is not configured. Cannot submit on-chain resolve_round.");
+    }
+
+    const server = this.stellarRpcGateway.rpcServer;
+    const signer = Keypair.fromSecret(signerSecret);
+    const sourceAccount = await this.stellarRpcGateway.getAccount(signer.publicKey(), "RoundService.submitOnChainResolve");
+    const contract = new Contract(contractId);
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: "100",
+      networkPassphrase: this.stellarConfig.networkPassphrase,
+    })
+      .addOperation(contract.call("resolve_round", xdr.ScVal.scvU32(roundNumber)))
+      .setTimeout(60)
+      .build();
+
+    const simulated = await this.stellarRpcGateway.simulateTransaction(tx);
+    if (simulated.error) {
+      throw new Error(`resolve_round simulation failed: ${simulated.error}`);
+    }
+    if (!("result" in simulated)) {
+      throw new Error("resolve_round simulation returned no result");
+    }
+
+    const prepared = TransactionBuilder.fromXDR(xdr.Transaction.toXDR(tx), this.stellarConfig.networkPassphrase).build();
+    prepared.sign(signer);
+
+    const sendResult = await this.stellarRpcGateway.sendTransaction(prepared);
+    if (sendResult.status === "PENDING" || sendResult.status === "DUPLICATE") {
+      const hash = sendResult.hash;
+      const maxPolls = this.stellarConfig.roundConfirmMaxPolls;
+      const basePollMs = this.stellarConfig.roundConfirmPollMs;
+      const start = Date.now();
+
+      for (let attempt = 0; attempt < maxPolls; attempt++) {
+        // Exponential backoff with ±10 % jitter, capped at 30 s.
+        const delay = Math.min(
+          basePollMs * Math.pow(1.5, attempt) * (0.9 + Math.random() * 0.2),
+          30_000,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+
+        const elapsed = Date.now() - start;
+        const status = await this.stellarRpcGateway.getTransaction(hash);
+
+        console.info(
+          `[roundService] resolve_round poll attempt=${attempt + 1}/${maxPolls} ` +
+          `status=${status.status} elapsed=${elapsed}ms hash=${hash}`,
+        );
+
+        if (status.status === "SUCCESS") {
+          return roundNumber;
+        }
+        if (status.status === "FAILED") {
+          throw new Error(`resolve_round transaction failed: hash=${hash}`);
+        }
+      }
+      throw new Error(
+        `resolve_round transaction timed out after ${maxPolls} polls: hash=${hash}`,
+      );
+    }
+    throw new Error(`resolve_round send failed: ${sendResult.status}`);
   }
 
   async resolveRound(input: RoundInput): Promise<RoundResolution> {
     const start = Date.now();
 
     try {
-      const result = await this.prisma.$transaction(async (tx: any) => {
-        const round = await tx.round.findUnique({
-          where: { id: input.roundId },
-          include: { eliminationLogs: true },
-        });
+      const round = await this.roundRepo.findById(input.roundId);
+      if (!round) throw new Error('Round not found');
+      if (round.state !== RoundState.OPEN && round.state !== RoundState.CLOSED) {
+        throw new Error(`Round already in state: ${round.state}`);
+      }
 
-        if (!round) throw new Error('Round not found');
-        if (round.state !== RoundState.OPEN && round.state !== RoundState.CLOSED) {
-          throw new Error(`Round already in state: ${round.state}`);
-        }
+      // Submit on-chain resolve_round BEFORE computing eliminations so that
+      // the contract's authoritative state is available to read back via
+      // get_players. If this fails the DB is untouched, preventing desync.
+      await this.submitOnChainResolve(input.arenaContractId, round.roundNumber);
 
-        const eliminatedPlayers = this.computeEliminations(
-          input.playerChoices,
-          input.oracleYield,
-          input.randomSeed
-        );
+      // ── #1098: derive eliminations from on-chain PlayerState.active ──────
+      // The Soroban contract is the single source of truth for the
+      // minority-wins elimination logic. Reading get_players() after
+      // resolve_round is confirmed eliminates any risk of TypeScript
+      // re-implementation diverging from on-chain behaviour (tie-breaking,
+      // no-submission handling, etc.).
+      const activePlayerIds = await this.onChainReader.getActivePlayers(input.arenaContractId);
+      const activeSet = new Set(activePlayerIds);
+      const eliminatedPlayers = input.allActivePlayerIds.filter(
+        id => !activeSet.has(id)
+      );
 
-        const payouts = this.computePayouts(
-          input.playerChoices,
-          eliminatedPlayers,
-          input.oracleYield
-        );
+      // ── #1099: always one payout record — the single on-chain winner ──────
+      // The arena contract sets exactly one winner via set_winner() and pays
+      // that address the full prize pool via claim(). Creating multiple payout
+      // records or splitting the pool causes on-chain submission failures.
+      const payouts = await this.computePayouts(
+        input.arenaContractId,
+        input.playerChoices,
+        eliminatedPlayers,
+        input.oracleYield
+      );
 
-        const poolBalances = this.computePoolBalances(
-          input.playerChoices,
-          eliminatedPlayers
-        );
+      const poolBalances = this.computePoolBalances(
+        input.playerChoices,
+        eliminatedPlayers
+      );
 
-        await tx.eliminationLog.createMany({
-          data: eliminatedPlayers.map(userId => ({
-            roundId: input.roundId,
-            userId,
-            reason: 'ELIMINATED_BY_ROUND',
-          })),
-        });
+      const result = { eliminatedPlayers, payouts, poolBalances };
+      const metadata: RoundMetadata = {
+        playerChoices: input.playerChoices,
+        oracleYield: input.oracleYield,
+        randomSeed: input.randomSeed,
+        resolution: result,
+      };
 
-        await tx.round.update({
-          where: { id: input.roundId },
-          data: { 
-            state: RoundState.RESOLVED,
-            metadata: {
-              playerChoices: input.playerChoices,
-              oracleYield: input.oracleYield,
-              randomSeed: input.randomSeed,
-              resolution: { eliminatedPlayers, payouts, poolBalances }
-            } as any,
-            updatedAt: new Date() 
-          },
-        });
+      await this.roundRepo.resolveAtomically(
+        input.roundId,
+        RoundState.RESOLVED,
+        result,
+        metadata
+      );
 
-        return { eliminatedPlayers, payouts, poolBalances };
+      arenaStateTransitionsTotal.inc({
+        from_state: round.state,
+        to_state: RoundState.RESOLVED,
       });
+      playersEliminatedTotal.inc(eliminatedPlayers.length);
+      await refreshArenaMetrics(this.prisma);
+
+      // Drop the now-stale arena stats cache so watchers see the resolved round
+      // immediately rather than after the TTL. Best-effort — a Redis outage
+      // must not fail an otherwise-successful resolution.
+      await invalidateArenaStats(round.arenaId).catch(() => {});
 
       const duration = (Date.now() - start) / 1000;
       roundResolutionDuration.observe(duration);
       roundResolutionsTotal.inc({ status: 'success' });
-      
+
       return result;
     } catch (error) {
       const duration = (Date.now() - start) / 1000;
@@ -81,56 +231,79 @@ export class RoundService {
     }
   }
 
-  private computeEliminations(
-    playerChoices: RoundInput['playerChoices'],
-    oracleYield: number,
-    randomSeed?: string
-  ): string[] {
-    const eliminated: string[] = [];
-    
-    for (const player of playerChoices) {
-      const threshold = this.calculateThreshold(player.choice, oracleYield, randomSeed);
-      if (threshold < 0.5) {
-        eliminated.push(player.userId);
-      }
-    }
-
-    return eliminated;
-  }
-
-  private calculateThreshold(choice: string, oracleYield: number, seed?: string): number {
-    const hash = this.deterministicHash(choice + oracleYield.toString() + (seed || ''));
-    return (hash % 100) / 100;
-  }
-
-  private deterministicHash(input: string): number {
-    let hash = 0;
-    for (let i = 0; i < input.length; i++) {
-      hash = ((hash << 5) - hash) + input.charCodeAt(i);
-      hash = hash & hash;
-    }
-    return Math.abs(hash);
-  }
-
-  private computePayouts(
+  /**
+   * Build the payout record for this round.
+   *
+   * The on-chain arena contract designates exactly one winner (the last
+   * surviving player) who receives 100% of the prize pool via `claim()`.
+   * This method reads that winner directly from on-chain via `get_winner`,
+   * ensuring the backend payout record always matches the on-chain
+   * entitlement and never produces under-paying or multi-winner XDRs.
+   *
+   * If the game is not yet finished (multi-round game still in progress)
+   * there is no on-chain winner yet and we return an empty array — payout
+   * records are only created at game end.
+   *
+   * A failed `get_winner` read is deliberately NOT treated as "no winner
+   * yet" (#1344): it throws OnChainReadError, which aborts the resolution
+   * before the round is committed as RESOLVED. Collapsing the two cases
+   * would strand a real winner's prize behind resolveRound's state guard.
+   */
+  private async computePayouts(
+    arenaContractId: string,
     playerChoices: RoundInput['playerChoices'],
     eliminatedPlayers: string[],
     oracleYield: number
-  ): Payout[] {
-    const winners = playerChoices.filter(p => !eliminatedPlayers.includes(p.userId));
+  ): Promise<Payout[]> {
+    // Read the single authoritative winner from on-chain. A transient RPC
+    // failure propagates as OnChainReadError rather than being flattened
+    // into the "no winner yet" branch below.
+    const onChainWinner = await this.onChainReader.getWinner(arenaContractId);
+    if (!onChainWinner) {
+      // Game is still in progress (more rounds to go); no payout yet.
+      return [];
+    }
+
+    // Compute prize = all eliminated stakes + oracle yield on the total pool.
     const eliminatedStake = playerChoices
       .filter(p => eliminatedPlayers.includes(p.userId))
       .reduce((sum, p) => sum + p.stake, 0);
 
-    if (winners.length === 0) return [];
+    // Find the on-chain winner's stake entry to add their own principal back.
+    const winnerChoice = playerChoices.find(p => p.userId === onChainWinner);
+    const winnerStake = winnerChoice?.stake ?? 0;
 
-    const prizePool = eliminatedStake * (1 + oracleYield / 100);
-    const payoutPerWinner = prizePool / winners.length;
+    // #1407: compute the reconcilable breakdown alongside the payout amount,
+    // rather than just the lump sum. amount stays exactly what it was before
+    // this breakdown existed (principal + yieldAmount, since platformFee/dust
+    // are 0 at the default PLATFORM_FEE_BPS) — see settlementService's design
+    // note for why the payout amount only actually changes if an operator
+    // opts into a nonzero fee.
+    const breakdown = computeSettlementBreakdown({
+      winnerStake,
+      eliminatedStake,
+      oracleYieldPercent: oracleYield,
+    });
 
-    return winners.map(w => ({
-      userId: w.userId,
-      amount: w.stake + payoutPerWinner,
-    }));
+    return [{
+      userId: onChainWinner,
+      amount: breakdown.netPayout,
+      principal: breakdown.principal,
+      yieldAmount: breakdown.yieldAmount,
+      platformFee: breakdown.platformFee,
+      dust: breakdown.dust,
+    }];
+  }
+
+  async closeRound(roundId: string): Promise<{ state: RoundState }> {
+    const round = await this.roundRepo.findById(roundId);
+    if (!round) throw new Error(`Round ${roundId} not found`);
+    if (round.state !== RoundState.OPEN) {
+      throw new Error(`Round is not OPEN (current state: ${round.state})`);
+    }
+    await this.roundRepo.updateState(roundId, RoundState.CLOSED);
+    arenaStateTransitionsTotal.inc({ from_state: RoundState.OPEN, to_state: RoundState.CLOSED });
+    return { state: RoundState.CLOSED };
   }
 
   private computePoolBalances(

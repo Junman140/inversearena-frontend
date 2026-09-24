@@ -35,7 +35,7 @@ export function isValidDecimalPrecision(value: string, currency: Currency): bool
     }
 
     if (parts.length === 2) {
-        return parts[1].length <= precision;
+        return parts[1]!.length <= precision;
     }
 
     return false; // Multiple decimal points
@@ -73,7 +73,7 @@ export function formatCurrencyInput(value: string, currency: Currency): string {
     // If there's a decimal point, limit the decimal places
     const parts = sanitized.split(".");
     if (parts.length === 2) {
-        return parts[0] + "." + parts[1].slice(0, precision);
+        return parts[0]! + "." + parts[1]!.slice(0, precision);
     }
 
     return sanitized;
@@ -95,6 +95,15 @@ export function validateStakeAmount(params: StakeValidationParams): ValidationRe
 
     // Check for invalid format
     if (amount === "." || amount.endsWith(".") && amount.split(".")[1] === "") {
+        return {
+            isValid: false,
+            error: "Please enter a valid amount",
+        };
+    }
+
+    // Reject multiple decimal points before numeric parsing (parseFloat would
+    // otherwise silently truncate e.g. "1.2.3" to 1.2)
+    if (amount.split(".").length > 2) {
         return {
             isValid: false,
             error: "Please enter a valid amount",

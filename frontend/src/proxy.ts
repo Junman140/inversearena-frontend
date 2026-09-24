@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseAllowedOrigins } from "@/shared-d/utils/security-validation";
-import { STELLAR_NETWORK } from "@/components/hook-d/arenaConstants";
+import { HSTS_HEADER_VALUE, generateNonce } from "@/lib/csp";
+
+const DEFAULT_TESTNET_HORIZON_URL = "https://horizon-testnet.stellar.org";
+const DEFAULT_TESTNET_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+const DEFAULT_MAINNET_HORIZON_URL = "https://horizon.stellar.org";
+const DEFAULT_MAINNET_SOROBAN_RPC_URL = "https://mainnet.sorobanrpc.com";
 
 function toOrigin(url: string): string {
   const candidate = url.trim();
@@ -13,13 +18,28 @@ function toOrigin(url: string): string {
 }
 
 function getNetworkConnectSources(): string[] {
-  const horizonOrigin = toOrigin(STELLAR_NETWORK.HORIZON_URL);
-  const sorobanOrigin = toOrigin(STELLAR_NETWORK.SOROBAN_RPC_URL);
+  const isMainnet =
+    process.env.NEXT_PUBLIC_STELLAR_NETWORK?.toLowerCase() === "mainnet";
+  const horizonUrl =
+    process.env.NEXT_PUBLIC_HORIZON_URL ??
+    (isMainnet ? DEFAULT_MAINNET_HORIZON_URL : DEFAULT_TESTNET_HORIZON_URL);
+  const sorobanRpcUrl =
+    process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ??
+    (isMainnet ? DEFAULT_MAINNET_SOROBAN_RPC_URL : DEFAULT_TESTNET_SOROBAN_RPC_URL);
+  const horizonOrigin = toOrigin(horizonUrl);
+  const sorobanOrigin = toOrigin(sorobanRpcUrl);
   return [horizonOrigin, sorobanOrigin];
 }
 
 function getAllowedOrigins(): string[] {
-  const configuredOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+  let configuredOrigins: string[];
+  try {
+    configuredOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid ALLOWED_ORIGINS configuration: ${message}`);
+  }
+
   const appOrigin = process.env.NEXT_PUBLIC_APP_ORIGIN;
   const defaults =
     process.env.NODE_ENV === "development"
@@ -35,7 +55,7 @@ function getAllowedOrigins(): string[] {
   );
 }
 
-function buildCsp(allowedOrigins: string[]) {
+function buildCsp(allowedOrigins: string[], nonce: string) {
   const isDev = process.env.NODE_ENV !== "production";
 
   const connectSrc = Array.from(
@@ -51,7 +71,12 @@ function buildCsp(allowedOrigins: string[]) {
     connectSrc.push("ws:", "wss:");
   }
 
-  const scriptSrc = ["'self'", "'unsafe-inline'"];
+  // #1296 — no 'unsafe-inline': an injected inline <script> must not run.
+  // 'self' is kept for pre-CSP3 browsers (which honour the nonce but ignore
+  // 'strict-dynamic'); 'strict-dynamic' lets the nonce'd framework bootstrap
+  // load the rest of the chunk graph. Next's dev runtime still needs
+  // 'unsafe-eval'.
+  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "'strict-dynamic'"];
   if (isDev) {
     scriptSrc.push("'unsafe-eval'");
   }
@@ -76,7 +101,11 @@ function buildCsp(allowedOrigins: string[]) {
   return policies.join("; ");
 }
 
-function applySecurityHeaders(response: NextResponse, allowedOrigins: string[]) {
+function applySecurityHeaders(
+  response: NextResponse,
+  allowedOrigins: string[],
+  nonce: string
+) {
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("X-Frame-Options", "DENY");
   response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
@@ -86,7 +115,9 @@ function applySecurityHeaders(response: NextResponse, allowedOrigins: string[]) 
   );
   response.headers.set("Cross-Origin-Opener-Policy", "same-origin");
   response.headers.set("Cross-Origin-Resource-Policy", "same-origin");
-  response.headers.set("Content-Security-Policy", buildCsp(allowedOrigins));
+  // #1296 — instruct browsers to enforce HTTPS-only for this origin.
+  response.headers.set("Strict-Transport-Security", HSTS_HEADER_VALUE);
+  response.headers.set("Content-Security-Policy", buildCsp(allowedOrigins, nonce));
 }
 
 function applyCorsHeaders(
@@ -117,21 +148,30 @@ export function proxy(request: NextRequest) {
   const requestOrigin = request.headers.get("origin");
   const isApiRoute = request.nextUrl.pathname.startsWith("/api/");
 
+  // Fresh per-request CSP nonce (#1296). Exposed to the app on the forwarded
+  // request headers as `x-nonce`; the root layout reads it and hands it to
+  // next-themes so its inline anti-flash <script> is allowed without
+  // 'unsafe-inline'.
+  const nonce = generateNonce();
+
   if (isApiRoute && requestOrigin && !allowedOrigins.includes(requestOrigin)) {
     const forbidden = NextResponse.json(
       { error: "Origin not allowed by CORS policy" },
       { status: 403 }
     );
-    applySecurityHeaders(forbidden, allowedOrigins);
+    applySecurityHeaders(forbidden, allowedOrigins, nonce);
     return forbidden;
   }
+
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set("x-nonce", nonce);
 
   const response =
     isApiRoute && request.method === "OPTIONS"
       ? new NextResponse(null, { status: 204 })
-      : NextResponse.next();
+      : NextResponse.next({ request: { headers: requestHeaders } });
 
-  applySecurityHeaders(response, allowedOrigins);
+  applySecurityHeaders(response, allowedOrigins, nonce);
 
   if (isApiRoute) {
     applyCorsHeaders(response, requestOrigin, allowedOrigins);

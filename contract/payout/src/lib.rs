@@ -1,603 +1,676 @@
 #![no_std]
+mod snapshot_tests;
+mod storage;
+mod types;
 
-use soroban_sdk::{
-    Address, BytesN, Env, IntoVal, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
-    panic_with_error, symbol_short, token,
-};
+use soroban_sdk::{Address, BytesN, Env, Vec, contract, contractimpl, symbol_short, token};
+use storage::PayoutStorage;
+use types::PayoutError;
 
-const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
-const TREASURY_KEY: Symbol = symbol_short!("TREAS");
-const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
-const PAYOUT_COUNT_KEY: Symbol = symbol_short!("P_COUNT");
-const PENDING_HASH_KEY: Symbol = symbol_short!("P_HASH");
-const EXECUTE_AFTER_KEY: Symbol = symbol_short!("P_AFTER");
-const TOPIC_PAYOUT_EXECUTED: Symbol = symbol_short!("PAYOUT");
-const TOPIC_DUST_COLLECTED: Symbol = symbol_short!("DUST");
-const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
-const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
-const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
-const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
-const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
+/// Maximum recipients per `distribute_batch` call (Soroban compute budget guard).
+pub const MAX_BATCH_SIZE: u32 = 50;
 
-const FACTORY_KEY: Symbol = symbol_short!("FACTORY");
-
-const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
-const EVENT_VERSION: u32 = 1;
-
-// ── TTL constants ─────────────────────────────────────────────────────────────
-const PAYOUT_TTL_THRESHOLD: u32 = 100_000;
-const PAYOUT_TTL_EXTEND_TO: u32 = 535_680;
-const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
-const INSTANCE_TTL_EXTEND_TO: u32 = 535_680;
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArenaStatus {
-    Pending,
-    Active,
-    Completed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct ArenaRef {
-    pub contract: Address,
-    pub status: ArenaStatus,
-    pub host: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    CurrencyToken(Symbol),
-    Payout(Symbol, u32, u32, Address),
-    PrizePayout(u32),
-    SplitPayout(u32, Address),
-    SplitPayoutBatch(u32),
-    PayoutHistory(u64),
-    ArenaPayout(u64),
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct PayoutData {
-    pub winner: Address,
-    pub amount: i128,
-    pub currency: Symbol,
-    pub paid: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SplitPayoutReceipt {
-    pub arena_id: u32,
-    pub winner: Address,
-    pub amount: i128,
-    pub currency: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutReceipt {
-    pub arena_id: u64,
-    pub winner: Address,
-    pub amount: i128,
-    pub fee: i128,
-    pub timestamp: u64,
-    pub tx_hash_hint: Option<BytesN<32>>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutPage {
-    pub items: Vec<PayoutReceipt>,
-    pub next_cursor: Option<u64>,
-    pub has_more: bool,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum PayoutError {
-    UnauthorizedCaller = 1,
-    InvalidAmount = 2,
-    AlreadyPaid = 3,
-    NoWinners = 4,
-    TreasuryNotSet = 5,
-    /// Contract is paused; write operations are disabled.
-    Paused = 6,
-    NoPendingUpgrade = 7,
-    TimelockNotExpired = 8,
-    UpgradeAlreadyPending = 9,
-    HashMismatch = 10,
-}
-
+/// Payout contract — distributes winnings to the surviving player(s) of an
+/// arena (#660).
+///
+/// The backend `PaymentService` builds transactions calling `distribute_winnings`
+/// on this contract; it now lives in-repo so it is open source and auditable.
+///
+/// Distribution is admin-gated and idempotent per `payout_id`: a re-submitted
+/// payout id is rejected, so a retried backend request can never double-pay.
 #[contract]
 pub struct PayoutContract;
 
 #[contractimpl]
 impl PayoutContract {
-    /// Placeholder function — returns a fixed value for contract liveness checks.
-
-    pub fn hello(_env: Env) -> u32 {
-        789
-    }
-
-    pub fn __constructor(env: Env, admin: Address) {
+    /// One-time setup: record the admin authorised to distribute and the token
+    /// used for payouts.
+    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), PayoutError> {
         admin.require_auth();
-        env.storage().instance().set(&ADMIN_KEY, &admin);
-    }
-
-    pub fn init_factory(env: Env, factory: Address) {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-
-        env.storage().instance().set(&FACTORY_KEY, &factory);
-    }
-
-    pub fn admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .expect("not initialized")
-    }
-
-    pub fn set_treasury(env: Env, treasury: Address) {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        env.storage().instance().set(&TREASURY_KEY, &treasury);
-    }
-
-    pub fn treasury(env: Env) -> Result<Address, PayoutError> {
-        env.storage()
-            .instance()
-            .get(&TREASURY_KEY)
-            .ok_or(PayoutError::TreasuryNotSet)
-    }
-
-    /// Register a token contract address for a currency symbol.
-    /// Admin-only. Used so `distribute_winnings` can transfer tokens on-chain.
-    pub fn set_currency_token(env: Env, symbol: Symbol, token_address: Address) {
-        let admin = Self::admin(env.clone());
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&PAUSED_KEY)
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, PayoutError::Paused);
+        if PayoutStorage::has_admin(&env) {
+            return Err(PayoutError::AlreadyInitialised);
         }
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::CurrencyToken(symbol), &token_address);
+        PayoutStorage::set_admin(&env, &admin);
+        PayoutStorage::set_token(&env, &token);
+        Ok(())
     }
 
-    /// Distribute a payout to a single winner.
+    /// Upgrade this payout contract to `new_wasm_hash`.
     ///
-    /// The composite key `(ctx, pool_id, round_id, winner)` ensures idempotency:
-    /// the same combination can only be paid once.
-    ///
-    /// If the currency symbol has a registered token address (via
-    /// `set_currency_token`), the contract transfers `amount` tokens directly
-    /// to the winner. Otherwise, the payout is recorded on-chain only.
-    ///
-    /// # Errors
-    /// * `UnauthorizedCaller` — `caller` is not the admin.
-    /// * `InvalidAmount`      — `amount` is zero or negative.
-    /// * `AlreadyPaid`        — the composite key was already processed.
+    /// Only the configured admin may perform upgrades so payout history remains
+    /// attached to the same contract instance.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PayoutError> {
+        let admin = PayoutStorage::get_admin(&env)?;
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Single-winner payout: transfer `amount` of the configured token from the
+    /// contract's balance to `winner`. Idempotent on `payout_id`.
     pub fn distribute_winnings(
         env: Env,
-        caller: Address,
-        ctx: Symbol,
-        pool_id: u32,
-        round_id: u32,
+        payout_id: u64,
         winner: Address,
         amount: i128,
-        currency: Symbol,
     ) -> Result<(), PayoutError> {
-        caller.require_auth();
-
-        let factory: Address = env
-            .storage()
-            .instance()
-            .get(&FACTORY_KEY)
-            .expect("factory not initialized");
-
-        let arena_id = pool_id as u64;
-        let arena_ref: ArenaRef = env.invoke_contract(
-            &factory,
-            &soroban_sdk::Symbol::new(&env, "get_arena_ref"),
-            soroban_sdk::vec![&env, arena_id.into_val(&env)],
-        );
-
-        if caller != arena_ref.contract {
-            return Err(PayoutError::UnauthorizedCaller);
-        }
-
-        require_not_paused(&env)?;
+        let admin = PayoutStorage::get_admin(&env)?;
+        admin.require_auth();
 
         if amount <= 0 {
-            panic_with_error!(&env, PayoutError::InvalidAmount);
+            return Err(PayoutError::InvalidAmount);
+        }
+        if PayoutStorage::is_paid(&env, payout_id) {
+            return Err(PayoutError::AlreadyPaid);
         }
 
-        let payout_key = DataKey::Payout(ctx.clone(), pool_id, round_id, winner.clone());
-        if env
-            .storage()
-            .persistent()
-            .get::<_, PayoutData>(&payout_key)
-            .is_some()
-        {
-            panic_with_error!(&env, PayoutError::AlreadyPaid);
-        }
+        // Mark paid before transferring — idempotency + reentrancy guard.
+        PayoutStorage::mark_paid(&env, payout_id);
 
-        let payout_data = PayoutData {
-            winner: winner.clone(),
-            amount,
-            currency: currency.clone(),
-            paid: true,
-        };
-        env.storage().persistent().set(&payout_key, &payout_data);
-        env.storage().persistent().extend_ttl(
-            &payout_key,
-            PAYOUT_TTL_THRESHOLD,
-            PAYOUT_TTL_EXTEND_TO,
-        );
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
-
-        // Transfer tokens to winner if a token address is registered for this currency.
-        if let Some(token_address) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::CurrencyToken(currency.clone()))
-        {
-            token::Client::new(&env, &token_address).transfer(
-                &env.current_contract_address(),
-                &winner,
-                &amount,
-            );
+        let token_addr = PayoutStorage::get_token(&env)?;
+        let client = token::TokenClient::new(&env, &token_addr);
+        // Ensure contract has sufficient balance for the payout
+        let contract_balance = client.balance(&env.current_contract_address());
+        if amount > contract_balance {
+            return Err(PayoutError::InsufficientBalance);
         }
+        client.transfer(&env.current_contract_address(), &winner, &amount);
 
         env.events()
-            .publish((TOPIC_PAYOUT_EXECUTED,), (winner, amount, currency));
-
-        record_receipt(&env, pool_id as u64, payout_data.winner, amount, 0, None);
-
+            .publish((symbol_short!("payout"), winner), (payout_id, amount));
         Ok(())
     }
 
-    /// Returns whether a payout for the composite key has already been processed.
-    pub fn is_payout_processed(
+    /// Multi-recipient batch payout in a single transaction. All amounts are
+    /// validated before any transfer, and the batch is idempotent on `payout_id`.
+    /// Duplicate recipient addresses are rejected to prevent double-payment.
+    pub fn distribute_batch(
         env: Env,
-        ctx: Symbol,
-        pool_id: u32,
-        round_id: u32,
-        winner: Address,
-    ) -> bool {
-        let payout_key = DataKey::Payout(ctx, pool_id, round_id, winner);
-        env.storage()
-            .persistent()
-            .get::<_, PayoutData>(&payout_key)
-            .map(|p| p.paid)
-            .unwrap_or(false)
-    }
-
-    /// Returns the stored `PayoutData` for the composite key, or `None` if not processed.
-    pub fn get_payout(
-        env: Env,
-        ctx: Symbol,
-        pool_id: u32,
-        round_id: u32,
-        winner: Address,
-    ) -> Option<PayoutData> {
-        let payout_key = DataKey::Payout(ctx, pool_id, round_id, winner);
-        env.storage().persistent().get(&payout_key)
-    }
-
-    pub fn distribute_prize(
-        env: Env,
-        game_id: u32,
-        total_prize: i128,
-        winners: Vec<Address>,
-        currency: Address,
+        payout_id: u64,
+        recipients: Vec<(Address, i128)>,
     ) -> Result<(), PayoutError> {
-        let admin = Self::admin(env.clone());
+        let admin = PayoutStorage::get_admin(&env)?;
         admin.require_auth();
 
-        require_not_paused(&env)?;
-
-        // Idempotency guard — prevent double-payment on retry
-        let prize_key = DataKey::PrizePayout(game_id);
-        if env.storage().instance().has(&prize_key) {
-            return Err(PayoutError::AlreadyPaid);
+        if recipients.is_empty() {
+            return Err(PayoutError::EmptyBatch);
         }
-
-        if total_prize <= 0 {
-            return Err(PayoutError::InvalidAmount);
+        if recipients.len() > MAX_BATCH_SIZE {
+            return Err(PayoutError::BatchTooLarge);
         }
-        if winners.is_empty() {
-            return Err(PayoutError::NoWinners);
-        }
-
-        let treasury = Self::treasury(env.clone())?;
-        let count = winners.len() as i128;
-        let share = total_prize / count;
-        let dust = total_prize % count;
-
-        // Effects before interactions: mark idempotency guard first.
-        env.storage().instance().set(&prize_key, &true);
-
-        let token_client = token::Client::new(&env, &currency);
-        let contract_address = env.current_contract_address();
-
-        for winner in winners.iter() {
-            token_client.transfer(&contract_address, &winner, &share);
-            env.events()
-                .publish((TOPIC_PAYOUT_EXECUTED,), (winner, share, currency.clone()));
-        }
-
-        if dust > 0 {
-            token_client.transfer(&contract_address, &treasury, &dust);
-            env.events()
-                .publish((TOPIC_DUST_COLLECTED,), (treasury, dust, currency));
-        }
-
-        Ok(())
-    }
-
-    pub fn get_payout_history(env: Env, cursor: Option<u64>, limit: u32) -> PayoutPage {
-        let count: u64 = env.storage().instance().get(&PAYOUT_COUNT_KEY).unwrap_or(0);
-        let start = cursor.unwrap_or(0).min(count);
-        let clamped_limit = limit.min(100);
-        let end = start.saturating_add(clamped_limit as u64).min(count);
-        let mut items = Vec::new(&env);
-
-        for index in start..end {
-            if let Some(receipt) = env
-                .storage()
-                .persistent()
-                .get::<_, PayoutReceipt>(&DataKey::PayoutHistory(index))
-            {
-                items.push_back(receipt);
+        // Duplicate check is O(n²) via Vec::contains. With MAX_BATCH_SIZE = 50
+        // this is at most 1,250 comparisons — within compute budget and
+        // acceptable given the cap (issue #1027).
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut total_amount: i128 = 0;
+        for (recipient, amount) in recipients.iter() {
+            if amount <= 0 {
+                return Err(PayoutError::InvalidAmount);
             }
+            if seen.contains(&recipient) {
+                return Err(PayoutError::DuplicateRecipient);
+            }
+            seen.push_back(recipient);
+            total_amount = total_amount.saturating_add(amount);
         }
-
-        PayoutPage {
-            items,
-            next_cursor: if end < count { Some(end) } else { None },
-            has_more: end < count,
+        // Verify contract has enough balance for total payout
+        let token_addr = PayoutStorage::get_token(&env)?;
+        let client = token::TokenClient::new(&env, &token_addr);
+        let contract_balance = client.balance(&env.current_contract_address());
+        if total_amount > contract_balance {
+            return Err(PayoutError::InsufficientBalance);
         }
-    }
-
-    pub fn get_payout_by_arena(env: Env, arena_id: u64) -> Option<PayoutReceipt> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ArenaPayout(arena_id))
-    }
-
-    pub fn is_prize_distributed(env: Env, game_id: u32) -> bool {
-        env.storage().instance().has(&DataKey::PrizePayout(game_id))
-    }
-
-    /// Splits and transfers `total_amount` across `winners`.
-    ///
-    /// Remainder dust from integer division is sent to the first winner so
-    /// no funds are left stranded in the contract.
-    pub fn distribute_split_payout(
-        env: Env,
-        arena_id: u32,
-        winners: Vec<Address>,
-        total_amount: i128,
-        currency: Address,
-    ) -> Result<(), PayoutError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-
-        require_not_paused(&env)?;
-
-        if total_amount <= 0 {
-            return Err(PayoutError::InvalidAmount);
-        }
-        if winners.is_empty() {
-            return Err(PayoutError::NoWinners);
-        }
-
-        let batch_key = DataKey::SplitPayoutBatch(arena_id);
-        if env.storage().instance().has(&batch_key) {
+        if PayoutStorage::is_paid(&env, payout_id) {
             return Err(PayoutError::AlreadyPaid);
         }
 
-        let winners_count = winners.len() as i128;
-        let per_winner = total_amount / winners_count;
-        let remainder = total_amount % winners_count;
-        let first_winner = winners.get(0).ok_or(PayoutError::NoWinners)?;
+        // Mark paid BEFORE transfers (checks-effects-interactions pattern).
+        // This prevents a reentrant call via a malicious token callback from
+        // replaying the batch because the idempotency guard is already set.
+        PayoutStorage::mark_paid(&env, payout_id);
 
-        // Idempotency guard first (effects before interactions)
-        env.storage().instance().set(&batch_key, &true);
-
-        let token_client = token::Client::new(&env, &currency);
-        let contract_address = env.current_contract_address();
-
-        for winner in winners.iter() {
-            let amount = if winner == first_winner {
-                per_winner
-                    .checked_add(remainder)
-                    .ok_or(PayoutError::InvalidAmount)?
-            } else {
-                per_winner
-            };
-
-            token_client.transfer(&contract_address, &winner, &amount);
-
-            let receipt = SplitPayoutReceipt {
-                arena_id,
-                winner: winner.clone(),
-                amount,
-                currency: currency.clone(),
-            };
-            let receipt_key = DataKey::SplitPayout(arena_id, winner.clone());
-            env.storage().persistent().set(&receipt_key, &receipt);
-            env.storage()
-                .persistent()
-                .extend_ttl(&receipt_key, PAYOUT_TTL_THRESHOLD, PAYOUT_TTL_EXTEND_TO);
-
+        let contract = env.current_contract_address();
+        for (recipient, amount) in recipients.iter() {
+            client.transfer(&contract, &recipient, &amount);
             env.events()
-                .publish((TOPIC_PAYOUT_EXECUTED,), (winner, amount, currency.clone()));
+                .publish((symbol_short!("payout"), recipient), (payout_id, amount));
         }
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
-
         Ok(())
     }
 
-    pub fn is_split_payout_distributed(env: Env, arena_id: u32) -> bool {
-        env.storage()
-            .instance()
-            .has(&DataKey::SplitPayoutBatch(arena_id))
+    /// Whether a payout id has already been executed (off-chain reconciliation).
+    pub fn is_paid(env: Env, payout_id: u64) -> bool {
+        PayoutStorage::is_paid(&env, payout_id)
     }
 
-    pub fn get_split_payout_receipt(
-        env: Env,
-        arena_id: u32,
-        winner: Address,
-    ) -> Option<SplitPayoutReceipt> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SplitPayout(arena_id, winner))
+    pub fn admin(env: Env) -> Option<Address> {
+        PayoutStorage::get_admin(&env).ok()
     }
 
-    // ── Emergency pause ──────────────────────────────────────────────────────
+    pub fn token(env: Env) -> Option<Address> {
+        PayoutStorage::get_token(&env).ok()
+    }
 
-    /// Pause the contract, disabling all write operations. Admin-only.
-    pub fn pause(env: Env) {
-        let admin = Self::admin(env.clone());
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), PayoutError> {
+        let admin = PayoutStorage::get_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().set(&PAUSED_KEY, &true);
-        env.events().publish((TOPIC_PAUSED,), ());
-    }
-
-    /// Unpause the contract, re-enabling write operations. Admin-only.
-    pub fn unpause(env: Env) {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        env.storage().instance().remove(&PAUSED_KEY);
-        env.events().publish((TOPIC_UNPAUSED,), ());
-    }
-
-    /// Return whether the contract is currently paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
-    }
-
-    // ── Upgrade timelock ─────────────────────────────────────────────────────
-
-    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PayoutError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        if env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(PayoutError::UpgradeAlreadyPending);
-        }
-        let execute_after: u64 = env.ledger().timestamp() + TIMELOCK_PERIOD;
-        env.storage().instance().set(&PENDING_HASH_KEY, &new_wasm_hash);
-        env.storage().instance().set(&EXECUTE_AFTER_KEY, &execute_after);
-        env.events().publish(
-            (TOPIC_UPGRADE_PROPOSED,),
-            (EVENT_VERSION, new_wasm_hash, execute_after),
-        );
+        PayoutStorage::save_pending_admin(&env, &new_admin);
+        env.events()
+            .publish((symbol_short!("adm_prop"),), (new_admin,));
         Ok(())
     }
 
-    pub fn execute_upgrade(env: Env, expected_hash: BytesN<32>) -> Result<(), PayoutError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        let execute_after: u64 = env
-            .storage()
-            .instance()
-            .get(&EXECUTE_AFTER_KEY)
-            .ok_or(PayoutError::NoPendingUpgrade)?;
-        if env.ledger().timestamp() < execute_after {
-            return Err(PayoutError::TimelockNotExpired);
-        }
-        let stored_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&PENDING_HASH_KEY)
-            .ok_or(PayoutError::NoPendingUpgrade)?;
-        if stored_hash != expected_hash {
-            return Err(PayoutError::HashMismatch);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events().publish(
-            (TOPIC_UPGRADE_EXECUTED,),
-            (EVENT_VERSION, stored_hash.clone()),
-        );
-        env.deployer().update_current_contract_wasm(stored_hash);
+    pub fn accept_admin(env: Env) -> Result<(), PayoutError> {
+        let pending_admin = PayoutStorage::load_pending_admin(&env)
+            .ok_or(PayoutError::NoPendingAdmin)?;
+        pending_admin.require_auth();
+        let old_admin = PayoutStorage::get_admin(&env)?;
+        PayoutStorage::set_admin(&env, &pending_admin);
+        PayoutStorage::delete_pending_admin(&env);
+        env.events()
+            .publish((symbol_short!("adm_chg"),), (old_admin, pending_admin));
         Ok(())
     }
-
-    pub fn cancel_upgrade(env: Env) -> Result<(), PayoutError> {
-        let admin = Self::admin(env.clone());
-        admin.require_auth();
-        if !env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(PayoutError::NoPendingUpgrade);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events().publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
-        Ok(())
-    }
-
-    pub fn pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
-        let hash: Option<BytesN<32>> = env.storage().instance().get(&PENDING_HASH_KEY);
-        let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
-        match (hash, after) {
-            (Some(h), Some(a)) => Some((h, a)),
-            _ => None,
-        }
-    }
-}
-
-/// Return `Err(PayoutError::Paused)` if the contract is currently paused.
-fn require_not_paused(env: &Env) -> Result<(), PayoutError> {
-    if env.storage().instance().get(&PAUSED_KEY).unwrap_or(false) {
-        return Err(PayoutError::Paused);
-    }
-    Ok(())
-}
-
-fn record_receipt(
-    env: &Env,
-    arena_id: u64,
-    winner: Address,
-    amount: i128,
-    fee: i128,
-    tx_hash_hint: Option<BytesN<32>>,
-) {
-    let index: u64 = env.storage().instance().get(&PAYOUT_COUNT_KEY).unwrap_or(0);
-    let receipt = PayoutReceipt {
-        arena_id,
-        winner,
-        amount,
-        fee,
-        timestamp: env.ledger().timestamp(),
-        tx_hash_hint,
-    };
-    env.storage()
-        .persistent()
-        .set(&DataKey::PayoutHistory(index), &receipt);
-    env.storage()
-        .persistent()
-        .set(&DataKey::ArenaPayout(arena_id), &receipt);
-    env.storage()
-        .instance()
-        .set(&PAYOUT_COUNT_KEY, &(index + 1));
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token;
+
+    struct Fixture {
+        env: Env,
+        client: PayoutContractClient<'static>,
+        token: token::TokenClient<'static>,
+    }
+
+    /// Deploy a payout contract funded with `funding` of a fresh test token.
+    fn setup(funding: i128) -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_addr = sac.address();
+
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &token_addr);
+
+        // Fund the payout contract so it can pay winners.
+        let token_admin = token::StellarAssetClient::new(&env, &token_addr);
+        token_admin.mint(&contract_id, &funding);
+
+        let token = token::TokenClient::new(&env, &token_addr);
+        Fixture { env, client, token }
+    }
+
+    #[test]
+    fn distributes_single_winner() {
+        let fx = setup(1_000);
+        let winner = Address::generate(&fx.env);
+
+        fx.client.distribute_winnings(&1, &winner, &600);
+
+        assert_eq!(fx.token.balance(&winner), 600);
+        assert!(fx.client.is_paid(&1));
+    }
+
+    #[test]
+    fn rejects_duplicate_payout_id() {
+        let fx = setup(1_000);
+        let winner = Address::generate(&fx.env);
+
+        fx.client.distribute_winnings(&7, &winner, &100);
+        let again = fx.client.try_distribute_winnings(&7, &winner, &100);
+        assert!(again.is_err());
+        // Only paid once.
+        assert_eq!(fx.token.balance(&winner), 100);
+    }
+
+    #[test]
+    fn rejects_non_positive_amount() {
+        let fx = setup(1_000);
+        let winner = Address::generate(&fx.env);
+        assert!(fx.client.try_distribute_winnings(&1, &winner, &0).is_err());
+    }
+
+    #[test]
+    fn distributes_batch_to_multiple_recipients() {
+        let fx = setup(1_000);
+        let a = Address::generate(&fx.env);
+        let b = Address::generate(&fx.env);
+
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((a.clone(), 300i128));
+        recipients.push_back((b.clone(), 150i128));
+        fx.client.distribute_batch(&42, &recipients);
+
+        assert_eq!(fx.token.balance(&a), 300);
+        assert_eq!(fx.token.balance(&b), 150);
+        assert!(fx.client.is_paid(&42));
+    }
+
+    #[test]
+    fn rejects_empty_batch() {
+        let fx = setup(1_000);
+        let recipients: Vec<(Address, i128)> = Vec::new(&fx.env);
+        assert!(fx.client.try_distribute_batch(&1, &recipients).is_err());
+    }
+
+    #[test]
+    fn distribute_batch_rejects_duplicate_recipients() {
+        let fx = setup(1_000);
+        let a = Address::generate(&fx.env);
+
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((a.clone(), 200i128));
+        recipients.push_back((a.clone(), 300i128));
+        let err = fx.client.try_distribute_batch(&1, &recipients);
+        assert!(err.is_err());
+        // Recipient should not have received any payment.
+        assert_eq!(fx.token.balance(&a), 0);
+    }
+
+    #[test]
+    fn distribute_batch_rejects_zero_amount_without_paying_anyone() {
+        let fx = setup(1_000);
+        let valid = Address::generate(&fx.env);
+        let invalid = Address::generate(&fx.env);
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((valid.clone(), 100));
+        recipients.push_back((invalid.clone(), 0));
+
+        assert!(fx.client.try_distribute_batch(&2, &recipients).is_err());
+        assert_eq!(fx.token.balance(&valid), 0);
+        assert_eq!(fx.token.balance(&invalid), 0);
+        assert!(!fx.client.is_paid(&2));
+    }
+
+    #[test]
+    fn distribute_batch_is_atomic_when_balance_is_insufficient() {
+        let fx = setup(100);
+        let first = Address::generate(&fx.env);
+        let second = Address::generate(&fx.env);
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((first.clone(), 60));
+        recipients.push_back((second.clone(), 60));
+
+        assert!(fx.client.try_distribute_batch(&3, &recipients).is_err());
+        assert_eq!(fx.token.balance(&first), 0);
+        assert_eq!(fx.token.balance(&second), 0);
+        assert!(!fx.client.is_paid(&3));
+    }
+
+    #[test]
+    fn distribute_batch_requires_admin_auth() {
+        let fx = setup(1_000);
+        let recipient = Address::generate(&fx.env);
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((recipient.clone(), 100));
+        fx.env.set_auths(&[]);
+
+        assert!(fx.client.try_distribute_batch(&4, &recipients).is_err());
+        assert_eq!(fx.token.balance(&recipient), 0);
+        assert!(!fx.client.is_paid(&4));
+    }
+
+    #[test]
+    fn rejects_oversized_batch() {
+        let fx = setup(100_000);
+        let mut recipients = Vec::new(&fx.env);
+        for _ in 0..(MAX_BATCH_SIZE + 1) {
+            recipients.push_back((Address::generate(&fx.env), 1i128));
+        }
+        assert!(fx.client.try_distribute_batch(&99, &recipients).is_err());
+        assert!(!fx.client.is_paid(&99));
+    }
+
+    #[test]
+    fn max_size_batch_succeeds() {
+        let fx = setup(100_000);
+        let mut recipients = Vec::new(&fx.env);
+        for _ in 0..MAX_BATCH_SIZE {
+            recipients.push_back((Address::generate(&fx.env), 1i128));
+        }
+        fx.client.distribute_batch(&100, &recipients);
+        assert!(fx.client.is_paid(&100));
+    }
+
+    /// initialize() must require auth from the admin address; an unauthenticated
+    /// caller cannot claim the admin role by frontrunning the deployment.
+    #[test]
+    #[should_panic]
+    fn initialize_without_auth_panics() {
+        let env = Env::default();
+        // Deliberately no mock_all_auths — auth is enforced.
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        // require_auth() inside initialize() must panic because admin hasn't signed.
+        client.initialize(&admin, &token);
+    }
+
+    // ── Issue #1148: unauthorised-initialize security tests ──────────────────
+    //
+    // The following three tests together verify that:
+    //  (a) an attacker who calls initialize() without admin auth is rejected,
+    //  (b) a legitimate admin CAN initialize (green contrast path), and
+    //  (c) after a failed initialisation attempt the contract remains
+    //      uninitialised — so the attacker cannot then call distribute_winnings.
+
+    /// (a) Attacker calls initialize without supplying admin.require_auth().
+    ///     The call must be rejected with an auth error, not succeed silently.
+    #[test]
+    fn initialize_attacker_without_auth_is_rejected() {
+        let env = Env::default();
+        // No mock_all_auths: auth requirements are enforced.
+
+        let intended_admin = Address::generate(&env);
+        let _attacker      = Address::generate(&env);
+        let token          = Address::generate(&env);
+
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+
+        // Empty auth set: admin.require_auth() inside initialize() will see no
+        // authorisation for `intended_admin` and must reject the call.
+        // This simulates an attacker who calls initialize without admin's signature.
+        env.set_auths(&[]);
+
+        let result = client.try_initialize(&intended_admin, &token);
+        assert!(
+            result.is_err(),
+            "initialize() must reject a caller who has not provided admin auth"
+        );
+    }
+
+    /// (b) The legitimate admin CAN initialize (green path / regression guard).
+    #[test]
+    fn initialize_with_correct_admin_auth_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+
+        // Admin signs → initialize must succeed.
+        let result = client.try_initialize(&admin, &token);
+        assert!(
+            result.is_ok(),
+            "initialize() must succeed when the admin provides auth"
+        );
+
+        // Admin view function should return the stored admin.
+        assert_eq!(client.admin(), Some(admin));
+    }
+
+    /// (c) After an attacker's failed initialize(), the contract remains
+    ///     uninitialised — the attacker cannot then call distribute_winnings.
+    ///
+    /// This is the critical security property: a failed initialisation
+    /// attempt must not leave the contract in a partially-owned state that
+    /// the attacker can exploit.
+    #[test]
+    fn attacker_cannot_distribute_winnings_after_failed_initialize() {
+        let env = Env::default();
+        // No mock_all_auths for the first (attacker) phase.
+
+        let intended_admin = Address::generate(&env);
+        let attacker       = Address::generate(&env);
+        let token          = Address::generate(&env);
+        let victim         = Address::generate(&env);
+
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+
+        // Step 1: attacker tries to call initialize without admin auth — must fail.
+        // (Use an empty auth set so require_auth() panics.)
+        env.set_auths(&[]);
+        let init_result = client.try_initialize(&intended_admin, &token);
+        assert!(
+            init_result.is_err(),
+            "attacker's initialize attempt must be rejected"
+        );
+
+        // Step 2: now the attacker tries distribute_winnings on the unowned
+        // contract. Because initialize failed, no admin is set, so
+        // get_admin() returns NotInitialised and the call must fail.
+        env.mock_all_auths(); // let auth pass so the rejection comes from logic, not auth
+        let distribute_result = client.try_distribute_winnings(&1, &victim, &1_000);
+        assert!(
+            distribute_result.is_err(),
+            "attacker must not be able to distribute_winnings on an uninitialised contract"
+        );
+    }
+
+    /// distribute_batch must be marked paid BEFORE any transfer. Verify by
+    /// confirming is_paid is set and a second call with the same payout_id
+    /// is rejected even if the first call's transfers complete.
+    #[test]
+    fn distribute_batch_idempotent_on_payout_id() {
+        let fx = setup(1_000);
+        let a = Address::generate(&fx.env);
+
+        let mut recipients = Vec::new(&fx.env);
+        recipients.push_back((a.clone(), 200i128));
+
+        fx.client.distribute_batch(&77, &recipients);
+
+        assert!(
+            fx.client.is_paid(&77),
+            "must be marked paid after first call"
+        );
+        assert_eq!(fx.token.balance(&a), 200, "recipient must receive payment");
+
+        // Second call with same id must be rejected — no double payment.
+        let err = fx.client.try_distribute_batch(&77, &recipients);
+        assert!(err.is_err(), "duplicate payout_id must be rejected");
+        assert_eq!(
+            fx.token.balance(&a),
+            200,
+            "balance must not change on rejected retry"
+        );
+    }
+
+    #[test]
+    fn distribute_before_initialise_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PayoutContract, ());
+        let client = PayoutContractClient::new(&env, &contract_id);
+        let winner = Address::generate(&env);
+        assert!(client.try_distribute_winnings(&1, &winner, &10).is_err());
+    }
+
+    #[test]
+    fn upgrade_requires_admin_auth() {
+        let fx = setup(1_000);
+        env_set_no_auths(&fx.env);
+        let wasm = BytesN::from_array(&fx.env, &[0u8; 32]);
+
+        assert!(fx.client.try_upgrade(&wasm).is_err());
+    }
+
+    fn env_set_no_auths(env: &Env) {
+        env.set_auths(&[]);
+    }
+
+    /// A malicious token whose `transfer` callback reenters
+    /// `distribute_batch` on the payout contract, attempting to replay the same
+    /// payout and double-pay the recipient. It implements just enough of the
+    /// SEP-41 surface (`balance` + `transfer`) for the payout contract to use it.
+    #[contract]
+    struct ReentrantToken;
+
+    #[contractimpl]
+    impl ReentrantToken {
+        /// Arm the attack: store the target payout contract and the
+        /// payout_id / recipient / amount the `transfer` callback will replay,
+        /// plus the (fake) balance to report so the payout's balance check passes.
+        pub fn arm(
+            env: Env,
+            payout: Address,
+            payout_id: u64,
+            recipient: Address,
+            amount: i128,
+            balance: i128,
+        ) {
+            let s = env.storage().persistent();
+            s.set(&symbol_short!("PAYOUT"), &payout);
+            s.set(&symbol_short!("PID"), &payout_id);
+            s.set(&symbol_short!("RECIP"), &recipient);
+            s.set(&symbol_short!("AMT"), &amount);
+            s.set(&symbol_short!("BAL"), &balance);
+            s.set(&symbol_short!("TCOUNT"), &0u32);
+            s.set(&symbol_short!("ATTEMPT"), &false);
+            s.set(&symbol_short!("BLOCKED"), &false);
+        }
+
+        /// Number of times `transfer` actually moved funds.
+        pub fn transfer_count(env: Env) -> u32 {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("TCOUNT"))
+                .unwrap_or(0)
+        }
+
+        /// Whether the reentrant `distribute_batch` call was rejected.
+        pub fn reentry_blocked(env: Env) -> bool {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("BLOCKED"))
+                .unwrap_or(false)
+        }
+
+        // ── SEP-41 surface used by the payout contract ──
+        pub fn balance(env: Env, _id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("BAL"))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            let s = env.storage().persistent();
+
+            // Count this (legitimate) transfer. A second count would mean the
+            // reentrant replay managed to pay the recipient again.
+            let count: u32 = s.get(&symbol_short!("TCOUNT")).unwrap_or(0);
+            s.set(&symbol_short!("TCOUNT"), &(count + 1));
+
+            // Reenter once, mid-transfer, and try to replay the batch.
+            let attempted: bool = s.get(&symbol_short!("ATTEMPT")).unwrap_or(false);
+            if !attempted {
+                s.set(&symbol_short!("ATTEMPT"), &true);
+
+                let payout: Address = s.get(&symbol_short!("PAYOUT")).unwrap();
+                let payout_id: u64 = s.get(&symbol_short!("PID")).unwrap();
+                let recipient: Address = s.get(&symbol_short!("RECIP")).unwrap();
+                let amount: i128 = s.get(&symbol_short!("AMT")).unwrap();
+
+                let mut recipients = Vec::new(&env);
+                recipients.push_back((recipient, amount));
+
+                let client = PayoutContractClient::new(&env, &payout);
+                let res = client.try_distribute_batch(&payout_id, &recipients);
+                // Record whether the replay was rejected.
+                s.set(&symbol_short!("BLOCKED"), &res.is_err());
+            }
+        }
+    }
+
+    /// Reentrancy guard: a malicious token that reenters `distribute_batch`
+    /// during its transfer callback must not be able to replay the payout.
+    /// Because the payout marks the id paid BEFORE any transfer
+    /// (checks-effects-interactions), the reentrant call is rejected and the
+    /// recipient is paid exactly once (#968).
+    #[test]
+    fn distribute_batch_blocks_reentrant_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        // Deploy the malicious token and a payout contract configured to use it.
+        let token_addr = env.register(ReentrantToken, ());
+        let token = ReentrantTokenClient::new(&env, &token_addr);
+
+        let payout_addr = env.register(PayoutContract, ());
+        let payout = PayoutContractClient::new(&env, &payout_addr);
+        payout.initialize(&admin, &token_addr);
+
+        // During its transfer callback the token replays distribute_batch(7),
+        // trying to pay `recipient` 100 a second time. Report a large balance so
+        // the payout's balance check is never the reason the replay fails.
+        token.arm(&payout_addr, &7u64, &recipient, &100i128, &1_000_000i128);
+
+        let mut recipients = Vec::new(&env);
+        recipients.push_back((recipient.clone(), 100i128));
+
+        // The single legitimate transfer triggers the reentrant attack inside.
+        payout.distribute_batch(&7, &recipients);
+
+        assert!(
+            token.reentry_blocked(),
+            "reentrant distribute_batch replay must be rejected"
+        );
+        assert_eq!(
+            token.transfer_count(),
+            1,
+            "recipient must be paid exactly once — reentrancy must not double-pay"
+        );
+        assert!(payout.is_paid(&7));
+    }
+
+    #[test]
+    fn propose_and_accept_admin_rotates_admin() {
+        let fx = setup(1_000);
+        let new_admin = Address::generate(&fx.env);
+
+        fx.client.propose_admin(&new_admin);
+        fx.client.accept_admin();
+
+        assert_eq!(fx.client.admin(), Some(new_admin));
+    }
+
+    #[test]
+    fn accept_admin_without_proposal_fails() {
+        let fx = setup(1_000);
+        let err = fx
+            .client
+            .try_accept_admin()
+            .err()
+            .expect("accept without propose must error")
+            .expect("error must be a contract error");
+        assert_eq!(err, PayoutError::NoPendingAdmin);
+    }
+
+    #[test]
+    fn propose_admin_requires_current_admin_auth() {
+        let fx = setup(1_000);
+        let new_admin = Address::generate(&fx.env);
+        fx.env.set_auths(&[]);
+        let result = fx.client.try_propose_admin(&new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn second_propose_overwrites_first() {
+        let fx = setup(1_000);
+        let addr_a = Address::generate(&fx.env);
+        let addr_b = Address::generate(&fx.env);
+
+        fx.client.propose_admin(&addr_a);
+        fx.client.propose_admin(&addr_b);
+        fx.client.accept_admin();
+
+        assert_eq!(fx.client.admin(), Some(addr_b));
+    }
+}

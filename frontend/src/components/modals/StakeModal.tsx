@@ -1,13 +1,24 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
-import { TrendingUp, CheckSquare, Zap, Info, Loader2, TerminalSquare, ShieldCheck } from "lucide-react";
-import { useWallet } from "@/shared-d/hooks/useWallet";
+import { TrendingUp, CheckSquare, Zap, Info, Loader2, TerminalSquare, ShieldCheck, AlertTriangle } from "lucide-react";
+import { useWallet } from "@/features/wallet/useWallet";
 import {
   buildStakeProtocolTransaction,
   submitSignedTransaction,
   parseStellarError,
+  STAKING_CONTRACT_ID,
+  STELLAR_PLACEHOLDERS,
 } from "@/shared-d/utils/stellar-transactions";
+import {
+  formatCurrencyInput,
+  sanitizeNumericInput,
+  type Currency,
+} from "@/shared-d/utils/form-validation";
+
+// Stakes here are denominated in XLM (the modal validates against
+// balance.xlm), so the shared helpers use XLM's 7-decimal precision.
+const STAKE_CURRENCY: Currency = "XLM";
 
 type TransactionState = "idle" | "signing" | "submitting" | "success" | "error";
 
@@ -26,8 +37,16 @@ export default function StakeModal({
   apy = 12.5,
   connectionLabel = "SOROBAN_MAINNET_NODE_04",
 }: StakeModalProps) {
-  const { address, isConnected, connect, signTransaction, balance, isLoadingBalance } =
-    useWallet();
+  const {
+    address,
+    isConnected,
+    connect,
+    signTransaction,
+    balance,
+    isLoadingBalance,
+    balanceError,
+    refreshBalance,
+  } = useWallet();
 
   const [amount, setAmount] = useState<string>("5000.00");
   const [txState, setTxState] = useState<TransactionState>("idle");
@@ -36,11 +55,23 @@ export default function StakeModal({
   const isProcessing = txState === "signing" || txState === "submitting";
   const displayBalance = balance.xlm;
   const numAmount = parseFloat(amount) || 0;
+  // #1295 — when the balance couldn't be loaded we don't actually know
+  // whether the amount is affordable, so we can't call it "valid" (and must
+  // never report "Insufficient balance" off a zero fallback).
   const isValidAmount = numAmount > 0 && numAmount <= displayBalance;
+
+  // Block staking if contract is not configured (#1112)
+  const isStakingContractConfigured =
+    STAKING_CONTRACT_ID &&
+    STAKING_CONTRACT_ID !== STELLAR_PLACEHOLDERS.stakingContractId &&
+    !STAKING_CONTRACT_ID.includes("...");
+
   const isButtonDisabled =
     isProcessing ||
     txState === "success" ||
-    (isConnected && !isValidAmount);
+    (isConnected && !!balanceError) ||
+    (isConnected && !isValidAmount) ||
+    !isStakingContractConfigured;
 
   useEffect(() => {
     if (!isOpen) {
@@ -63,6 +94,13 @@ export default function StakeModal({
 
     if (isNaN(numAmount) || numAmount <= 0) {
       setErrorMessage("Please enter a valid amount");
+      setTxState("error");
+      return;
+    }
+    // #1295 — don't fall through to the "Insufficient balance" check when the
+    // balance simply failed to load; that would be a misleading error.
+    if (balanceError) {
+      setErrorMessage("Couldn't load your balance. Retry before staking.");
       setTxState("error");
       return;
     }
@@ -92,7 +130,12 @@ export default function StakeModal({
   };
 
   const handleAmountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value.replace(/[^0-9.]/g, "");
+    // #1340 — the previous /[^0-9.]/g strip allowed multiple decimal points,
+    // so "12..34" stayed on screen while parseFloat silently read it as 12.
+    // Reuse the shared helpers PoolCreationModal already uses so both modals
+    // normalise identically.
+    const sanitized = sanitizeNumericInput(e.target.value);
+    const value = formatCurrencyInput(sanitized, STAKE_CURRENCY);
     setAmount(value);
     if (txState === "error") {
       setTxState("idle");
@@ -137,6 +180,8 @@ export default function StakeModal({
               <span className="border border-zinc-800 bg-lime-400 px-2.5 py-1 font-mono text-xs font-bold text-black">
                 {isLoadingBalance ? (
                   "LOADING..."
+                ) : balanceError ? (
+                  "BALANCE: UNAVAILABLE"
                 ) : (
                   <>BALANCE: {displayBalance.toLocaleString("en-US", { minimumFractionDigits: 2 })}</>
                 )}
@@ -196,6 +241,37 @@ export default function StakeModal({
               WALLET.
             </p>
           </div>
+
+          {/* Staking Contract Not Configured Warning (#1112) */}
+          {!isStakingContractConfigured && (
+            <div className="flex gap-3 rounded-sm border-l-4 border-red-500 bg-red-200/50 p-4">
+              <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-600" />
+              <p className="font-mono text-xs uppercase leading-relaxed tracking-wide text-zinc-800">
+                STAKING CONTRACT NOT CONFIGURED: THE STAKING FEATURE IS CURRENTLY
+                UNAVAILABLE. PLEASE CONTACT THE ADMINISTRATOR OR CHECK BACK LATER.
+              </p>
+            </div>
+          )}
+
+          {/* Balance Load Failure — retry, don't misreport as insufficient (#1295) */}
+          {isConnected && balanceError && !isLoadingBalance && (
+            <div className="flex items-center justify-between gap-3 rounded-sm border-l-4 border-yellow-500 bg-yellow-200/50 p-4">
+              <div className="flex gap-3">
+                <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-yellow-600" />
+                <p className="font-mono text-xs uppercase leading-relaxed tracking-wide text-zinc-800">
+                  COULDN&apos;T LOAD YOUR WALLET BALANCE. THIS IS USUALLY A TEMPORARY
+                  NETWORK ISSUE — RETRY BEFORE STAKING.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void refreshBalance()}
+                className="shrink-0 border-2 border-zinc-800 bg-white px-3 py-1.5 font-mono text-xs font-bold uppercase tracking-wider text-zinc-800 transition-colors hover:bg-zinc-100"
+              >
+                RETRY
+              </button>
+            </div>
+          )}
 
           {/* Success Message */}
           {txState === "success" && (

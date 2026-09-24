@@ -3,14 +3,19 @@ import cors from "cors";
 import helmet from "helmet";
 import { createApiRouter } from "./routes";
 import { createAdminRouter } from "./routes/admin";
+import { createWalletRoleRouter } from "./routes/walletRole";
+import { createMaintenanceStatusRouter } from "./routes/maintenance";
 import { errorHandler } from "./middleware/errorHandler";
 import { requestLogger } from "./middleware/logger";
+import { requestContextMiddleware } from "./middleware/requestContext";
 import { metricsMiddleware } from "./middleware/metrics";
+import { maintenanceGuard } from "./middleware/maintenance";
 import {
   ApiKeyAuthProvider,
   requireAdmin,
   requireAuth,
 } from "./middleware/auth";
+import { MaintenanceService } from "./services/maintenanceService";
 import { PayoutsController } from "./controllers/payouts.controller";
 import { WorkerController } from "./controllers/worker.controller";
 import { AdminController } from "./controllers/admin.controller";
@@ -19,7 +24,8 @@ import { UsersController } from "./controllers/users.controller";
 import { LeaderboardController } from "./controllers/leaderboard.controller";
 import { TransactionsController } from "./controllers/transactions.controller";
 import { RoundController } from "./controllers/round.controller";
-import { register } from "./utils/metrics";
+import { refreshArenaMetrics, register } from "./utils/metrics";
+import { redis } from "./cache/redisClient";
 import type { PaymentService } from "./services/paymentService";
 import type { PaymentWorker } from "./workers/paymentWorker";
 import type { TransactionRepository } from "./repositories/transactionRepository";
@@ -40,17 +46,99 @@ export interface AppDependencies {
 export function createApp(deps: AppDependencies): express.Application {
   const app = express();
 
-  app.use(helmet());
-  app.use(cors());
+  // Configure Helmet with security headers
+  app.use(
+    helmet({
+      // HSTS: Force HTTPS for 1 year, including subdomains
+      hsts: {
+        maxAge: 31536000, // 1 year in seconds
+        includeSubDomains: true,
+        preload: true,
+      },
+      // Referrer Policy: Balance privacy and analytics
+      referrerPolicy: {
+        policy: "strict-origin-when-cross-origin",
+      },
+      // Cross-Origin Opener Policy: Improve isolation
+      crossOriginOpenerPolicy: {
+        policy: "same-origin",
+      },
+      // Cross-Origin Resource Policy: Allow frontend to load from API
+      crossOriginResourcePolicy: {
+        policy: "cross-origin",
+      },
+      // Content Security Policy: Disabled (handled by Next.js frontend)
+      contentSecurityPolicy: false,
+      // Permitted Cross-Domain Policies: Disable Adobe Flash/PDF policies
+      permittedCrossDomainPolicies: {
+        permittedPolicies: "none",
+      },
+    })
+  );
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
+  app.use(cors({
+    origin: allowedOrigins.length > 0 ? allowedOrigins : undefined,
+    credentials: true,
+  }));
+  // Oracle webhook (#1127): enforce a strict body size cap before the default
+  // JSON parser buffers the payload. Mounted ahead of the global parser so
+  // oversized webhook bodies are rejected with 413 at the network layer
+  // instead of being accumulated in memory.
+  // `verify` stashes the exact bytes express-body-parser read off the wire
+  // onto req.rawBody, before JSON.parse touches them — verifyWebhookSignature
+  // HMACs that instead of JSON.stringify(req.body), since re-serializing an
+  // already-parsed object is not guaranteed to reproduce the sender's exact
+  // byte sequence (number formatting, key order, whitespace).
+  app.use(
+    "/api/oracle",
+    express.json({
+      limit: "4kb",
+      verify: (req, _res, buf) => {
+        (req as express.Request).rawBody = Buffer.from(buf);
+      },
+    }),
+  );
   app.use(express.json());
   app.use(requestLogger);
+  app.use(requestContextMiddleware);
   app.use(metricsMiddleware);
+
+  const maintenanceService = new MaintenanceService();
+  app.use(maintenanceGuard(maintenanceService));
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
   });
 
+  app.get("/ready", async (_req, res) => {
+    try {
+      const [dbResult, redisResult] = await Promise.all([
+        prisma.$queryRaw`SELECT 1`,
+        redis.ping(),
+      ]);
+
+      const breakerStats = deps.paymentService.getSorobanBreakerStats();
+
+      res.status(200).json({
+        status: "ready",
+        database: dbResult,
+        redis: redisResult,
+        sorobanCircuitBreaker: breakerStats,
+      });
+    } catch (error) {
+      res.status(503).json({
+        status: "not_ready",
+        error: error instanceof Error ? error.message : "Readiness check failed",
+      });
+    }
+  });
+
   app.get("/metrics", async (_req, res) => {
+    try {
+      await refreshArenaMetrics(prisma);
+    } catch {
+      // Keep the metrics endpoint available even if the database is degraded.
+    }
     res.set("Content-Type", register.contentType);
     res.send(await register.metrics());
   });
@@ -64,6 +152,7 @@ export function createApp(deps: AppDependencies): express.Application {
     deps.adminService,
     deps.paymentService,
     deps.transactions,
+    maintenanceService,
   );
   const authController = new AuthController(deps.authService);
   const usersController = new UsersController(prisma);
@@ -83,13 +172,17 @@ export function createApp(deps: AppDependencies): express.Application {
       usersController,
       leaderboardController,
       transactionsController,
+      adminAuthMiddleware,
       userAuthMiddleware,
+      deps.authService,
     ),
   );
+  app.use("/api/admin", createWalletRoleRouter());
   app.use(
     "/api/admin",
     createAdminRouter(adminController, roundController, adminAuthMiddleware),
   );
+  app.use("/api", createMaintenanceStatusRouter(maintenanceService));
 
   app.use(errorHandler);
 
